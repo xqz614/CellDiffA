@@ -1,0 +1,69 @@
+# ============================================================
+# CellDiffA Default Configuration
+# ============================================================
+
+# --- Data Settings ---
+data:
+  dataset: "norman"                  # Dataset name: norman, replogle_k562, adamson
+  n_top_genes: 2000                  # Number of highly variable genes
+  split_strategy: "additive"         # Split: additive, combinations, unseen
+  fold: 0
+  n_folds: 5
+  seed: 42
+  data_root: "./data"
+
+# --- SMC Engine Settings ---
+smc:
+  num_particles: 100                 # Number of SMC particles (generated cells)
+  resampling_strategy: "systematic"  # multinomial, systematic, stratified
+  ess_threshold: 0.5                 # ESS fraction to trigger resampling
+  tempering_schedule: "linear"       # linear, cosine, constant
+  initial_temperature: 0.1           # Temperature at t=T (weak guidance)
+  final_temperature: 1.0             # Temperature at t=0 (strong guidance)
+  output_mode: "top_k"              # weighted_mean, top_k, all
+  top_k: 50                          # Particles to keep if output_mode=top_k
+  batch_size_per_step: 100           # Max particles per forward pass
+
+# --- Reward Settings ---
+rewards:
+  aggregation: "linear"              # linear or pareto
+  rewards:
+    - type: "transcriptomic"
+      weight: 1.0
+      top_k: 20                      # Top DE genes to use as reference
+      combination_mode: "union"      # union or intersection for combo perturbations
+    - type: "geometric"
+      weight: 0.5
+    - type: "anchor"
+      weight: 0.3
+      max_distance: null             # Optional upper bound (null = no cap)
+
+# --- Evaluation Settings ---
+evaluation:
+  metrics:
+    - "mse_all"
+    - "pearson_all"
+    - "pearson_delta"
+    - "pearson_deg"
+    - "mse_deg"
+    - "deg_recall_top20"
+    - "energy_distance"
+    - "mmd_rbf"
+  top_k_deg: 20                      # Top-K for DEG recall computation
+  subsample_for_distribution: 200    # Max cells for distribution metrics
+
+# --- Training Settings (for baselines) ---
+training:
+  epochs: 500
+  batch_size: 64
+  lr: 1.0e-4
+  device: "cuda"
+  num_workers: 4
+  checkpoint_dir: "./checkpoints"
+
+# --- Logging ---
+logging:
+  log_dir: "./logs"
+  wandb_project: "CellDiffA"
+  wandb_entity: null
+  save_predictions: true
