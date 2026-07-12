@@ -58,6 +58,10 @@ class PerturbationDataManager:
         self.ctrl_adata: Optional[AnnData] = None
         self.de_genes: Optional[Dict[str, List[str]]] = None
 
+        # Track split state for cache key construction
+        self._split_strategy: Optional[str] = None
+        self._fold: Optional[int] = None
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -113,9 +117,13 @@ class PerturbationDataManager:
             f"Unsupported split: {split_strategy}. Choose from {self.SUPPORTED_SPLITS}"
         )
 
+        # Store split state for cache key construction
+        self._split_strategy = split_strategy
+        self._fold = fold
+
         split_file = os.path.join(
             self.splits_dir,
-            f"{self.dataset_name}_{split_strategy}_fold{fold}_of{n_folds}.pkl",
+            f"{self.dataset_name}_{split_strategy}_fold{fold}_of{n_folds}_seed{self.seed}.pkl",
         )
 
         if os.path.exists(split_file):
@@ -146,6 +154,18 @@ class PerturbationDataManager:
         )
         return self.adata_train, self.adata_test
 
+    def _get_prior_cache_key(self) -> str:
+        """
+        Construct a unique cache key that includes dataset, split strategy,
+        fold, and seed to prevent cross-fold/cross-split cache contamination.
+        """
+        if self._split_strategy is None or self._fold is None:
+            raise RuntimeError(
+                "Must call create_split() before computing priors. "
+                "Cache keys depend on split state."
+            )
+        return f"{self.dataset_name}_{self._split_strategy}_fold{self._fold}_seed{self.seed}"
+
     def compute_de_genes(self, top_k: int = 20) -> Dict[str, List[str]]:
         """
         Compute differentially expressed genes for each perturbation condition
@@ -157,9 +177,10 @@ class PerturbationDataManager:
         if self.adata_train is None:
             raise RuntimeError("Must call create_split() before compute_de_genes()")
 
+        cache_key = self._get_prior_cache_key()
         de_cache = os.path.join(
             self.processed_dir,
-            f"{self.dataset_name}_de_top{top_k}.pkl",
+            f"{cache_key}_de_top{top_k}.pkl",
         )
         if os.path.exists(de_cache):
             with open(de_cache, "rb") as f:
@@ -207,9 +228,10 @@ class PerturbationDataManager:
         if self.adata_train is None:
             raise RuntimeError("Must call create_split() before compute_perturbation_shifts()")
 
+        cache_key = self._get_prior_cache_key()
         shift_cache = os.path.join(
             self.processed_dir,
-            f"{self.dataset_name}_shifts.pkl",
+            f"{cache_key}_shifts.pkl",
         )
         if os.path.exists(shift_cache):
             with open(shift_cache, "rb") as f:
@@ -252,7 +274,8 @@ class PerturbationDataManager:
         if hasattr(ctrl_expr, "toarray"):
             ctrl_expr = ctrl_expr.toarray()
         if n_cells is not None and n_cells < ctrl_expr.shape[0]:
-            idx = np.random.choice(ctrl_expr.shape[0], n_cells, replace=False)
+            rng = np.random.default_rng(self.seed)
+            idx = rng.choice(ctrl_expr.shape[0], n_cells, replace=False)
             return ctrl_expr[idx]
         return ctrl_expr
 

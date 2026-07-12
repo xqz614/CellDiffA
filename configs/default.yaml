@@ -12,15 +12,18 @@ data:
   seed: 42
   data_root: "./data"
 
-# --- SMC Engine Settings ---
+# --- SMC Engine Settings (DAS-style) ---
 smc:
   num_particles: 100                 # Number of SMC particles (generated cells)
   resampling_strategy: "systematic"  # multinomial, systematic, stratified
   ess_threshold: 0.5                 # ESS fraction to trigger resampling
-  tempering_schedule: "linear"       # linear, cosine, constant
-  initial_temperature: 0.1           # Temperature at t=T (weak guidance)
-  final_temperature: 1.0             # Temperature at t=0 (strong guidance)
-  output_mode: "top_k"              # weighted_mean, top_k, all
+  tempering_schedule: "linear"       # linear, cosine, adaptive
+  alpha: 1.0                         # Reward temperature α (DAS default: 1.0)
+  start_timestep: 100                # Reverse process start (PerturbDiff: 100)
+  use_ddim: true                     # Use DDIM (deterministic) steps
+  eta: 0.0                           # DDIM noise scale (0 = deterministic)
+  guidance_strength: 1.0             # CFG strength for base model (PerturbDiff default: 1.0)
+  output_mode: "all"                 # weighted_mean, top_k, all
   top_k: 50                          # Particles to keep if output_mode=top_k
   batch_size_per_step: 100           # Max particles per forward pass
 
@@ -33,9 +36,9 @@ rewards:
       top_k: 20                      # Top DE genes to use as reference
       combination_mode: "union"      # union or intersection for combo perturbations
     - type: "geometric"
-      weight: 0.5
+      weight: 1.0
     - type: "anchor"
-      weight: 0.3
+      weight: 1.0
       max_distance: null             # Optional upper bound (null = no cap)
 
 # --- Evaluation Settings ---

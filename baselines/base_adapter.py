@@ -6,7 +6,7 @@ evaluation pipeline can treat them interchangeably.
 """
 
 from abc import ABC, abstractmethod
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from anndata import AnnData
@@ -63,20 +63,56 @@ class BaseAdapter(ABC):
         """
         pass
 
-    def load_checkpoint(self, path: str) -> None:
-        """Load a pre-trained model checkpoint."""
+    def load_checkpoint(
+        self,
+        checkpoint_path: str,
+        gene_names: Optional[List[str]] = None,
+        ctrl_adata: Optional[AnnData] = None,
+        **kwargs,
+    ) -> None:
+        """
+        Load a pre-trained model checkpoint.
+
+        Args:
+            checkpoint_path: Path to checkpoint file.
+            gene_names: List of gene names (HVGs) used in the experiment.
+            ctrl_adata: Control cell AnnData for building conditioning inputs.
+            **kwargs: Model-specific loading arguments.
+        """
         raise NotImplementedError(f"{self.model_name} does not support checkpoint loading.")
 
     def save_checkpoint(self, path: str) -> None:
         """Save the current model state."""
         raise NotImplementedError(f"{self.model_name} does not support checkpoint saving.")
 
-    def get_diffusion_sampler(self):
+    def build_condition(self, perturbation: str, **kwargs) -> Dict:
+        """
+        Build the condition dictionary for a given perturbation.
+
+        Only diffusion-based models need to implement this.
+        Non-diffusion models can ignore it.
+
+        Args:
+            perturbation: Perturbation condition string (e.g., "GeneA+GeneB").
+            **kwargs: Model-specific conditioning arguments.
+
+        Returns:
+            Condition dictionary compatible with get_diffusion_sampler().
+        """
+        raise NotImplementedError(
+            f"{self.model_name} does not support condition building."
+        )
+
+    def get_diffusion_sampler(self, condition_dict: Dict = None, **kwargs):
         """
         Return a diffusion sampler object compatible with CellDiffA's SMC engine.
 
         Only diffusion-based models (PerturbDiff, Squidiff, scDFM) need to implement this.
         Non-diffusion models should raise NotImplementedError.
+
+        Args:
+            condition_dict: Pre-built condition from build_condition().
+            **kwargs: Sampler-specific arguments (guidance_strength, eta, start_time).
 
         Returns:
             Object satisfying DiffusionSamplerProtocol.

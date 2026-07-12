@@ -23,9 +23,10 @@ import json
 import os
 import sys
 import time
-from typing import Dict
+from typing import Dict, List, Optional
 
 import numpy as np
+import torch
 import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -39,13 +40,18 @@ def load_config(config_path: str) -> dict:
 
 def get_adapter(model_name: str, device: str, **kwargs):
     """Factory function to instantiate the correct adapter."""
-    from baselines import GEARSAdapter, CPAAdapter, PerturbDiffAdapter, ScDFMAdapter
+    from baselines import (
+        GEARSAdapter, CPAAdapter, PerturbDiffAdapter, ScDFMAdapter,
+        SquidiffAdapter, CellFlowAdapter,
+    )
 
     adapters = {
         "gears": GEARSAdapter,
         "cpa": CPAAdapter,
         "perturbdiff": PerturbDiffAdapter,
         "scdfm": ScDFMAdapter,
+        "squidiff": SquidiffAdapter,
+        "cellflow": CellFlowAdapter,
     }
 
     if model_name not in adapters:
@@ -56,18 +62,23 @@ def get_adapter(model_name: str, device: str, **kwargs):
 
 def run_standard_evaluation(
     adapter,
-    test_conditions: list,
+    test_conditions: List[str],
     ground_truth: Dict[str, np.ndarray],
     ctrl_mean: np.ndarray,
     n_samples: int = 100,
-) -> Dict[str, float]:
+    ctrl_expr: Optional[torch.Tensor] = None,
+) -> tuple:
     """Run standard (non-CellDiffA) evaluation."""
     from celldiffa.evaluation import evaluate_all_conditions
 
     print(f"\n[Eval] Running standard inference with {adapter.model_name}...")
     start_time = time.time()
 
-    predictions = adapter.predict(test_conditions, n_samples=n_samples)
+    predictions = adapter.predict(
+        conditions=test_conditions,
+        n_samples=n_samples,
+        ctrl_expr=ctrl_expr,
+    )
 
     elapsed = time.time() - start_time
     print(f"[Eval] Inference completed in {elapsed:.1f}s")
@@ -83,41 +94,34 @@ def run_standard_evaluation(
 
 def run_celldiffa_evaluation(
     adapter,
-    test_conditions: list,
+    test_conditions: List[str],
     ground_truth: Dict[str, np.ndarray],
     ctrl_mean: np.ndarray,
     ctrl_cells: np.ndarray,
     config: dict,
-) -> Dict[str, float]:
-    """Run CellDiffA test-time alignment evaluation."""
-    import torch
+    gene_names: List[str],
+    de_genes: Dict[str, List[str]],
+    shifts: Dict[str, np.ndarray],
+    ds_name: str = "norman",
+) -> tuple:
+    """
+    Run CellDiffA test-time alignment evaluation.
+
+    This is the core pipeline:
+        For each test condition:
+            1. Build condition_dict via adapter.build_condition()
+            2. Get step-by-step sampler via adapter.get_diffusion_sampler()
+            3. Build reward function from training-set priors
+            4. Run SMC engine to generate aligned samples
+            5. Evaluate against ground truth
+    """
     from celldiffa.smc import SMCEngine, SMCConfig
     from celldiffa.smc.utils import build_reward_from_config
     from celldiffa.evaluation import evaluate_all_conditions
 
     print(f"\n[CellDiffA] Running SMC test-time alignment on {adapter.model_name}...")
 
-    # Get diffusion sampler from adapter
-    sampler = adapter.get_diffusion_sampler()
-
-    # Build reward function from config
-    # (Requires pre-computed priors from DataManager)
-    from data.data_manager import PerturbationDataManager
-    dm = PerturbationDataManager(
-        data_root=config["data"]["data_root"],
-        dataset_name=config["data"]["dataset"],
-        n_top_genes=config["data"]["n_top_genes"],
-        seed=config["data"]["seed"],
-    )
-    dm.load_and_preprocess()
-    dm.create_split(
-        split_strategy=config["data"]["split_strategy"],
-        fold=config["data"]["fold"],
-    )
-    de_genes = dm.compute_de_genes(top_k=config["rewards"]["rewards"][0].get("top_k", 20))
-    shifts = dm.compute_perturbation_shifts()
-    gene_names = list(dm.adata.var_names)
-
+    # --- Build composite reward from pre-computed priors ---
     reward_fn = build_reward_from_config(
         config=config["rewards"],
         de_genes=de_genes,
@@ -126,49 +130,81 @@ def run_celldiffa_evaluation(
         gene_names=gene_names,
     )
 
-    # Configure SMC engine
+    # --- SMC configuration (DAS-style) ---
+    smc_cfg = config["smc"]
     smc_config = SMCConfig(
-        num_particles=config["smc"]["num_particles"],
-        resampling_strategy=config["smc"]["resampling_strategy"],
-        ess_threshold=config["smc"]["ess_threshold"],
-        tempering_schedule=config["smc"]["tempering_schedule"],
-        initial_temperature=config["smc"]["initial_temperature"],
-        final_temperature=config["smc"]["final_temperature"],
-        output_mode=config["smc"]["output_mode"],
-        top_k=config["smc"]["top_k"],
+        num_particles=smc_cfg["num_particles"],
+        resampling_strategy=smc_cfg["resampling_strategy"],
+        ess_threshold=smc_cfg["ess_threshold"],
+        tempering_schedule=smc_cfg["tempering_schedule"],
+        alpha=smc_cfg["alpha"],
+        start_timestep=smc_cfg.get("start_timestep", None),
+        use_ddim=smc_cfg.get("use_ddim", True),
+        eta=smc_cfg.get("eta", 0.0),
+        guidance_strength=smc_cfg.get("guidance_strength", 1.0),
+        output_mode=smc_cfg["output_mode"],
+        top_k=smc_cfg["top_k"],
         device=config["training"]["device"],
-        batch_size_per_step=config["smc"]["batch_size_per_step"],
+        batch_size_per_step=smc_cfg["batch_size_per_step"],
     )
 
-    engine = SMCEngine(
-        model_sampler=sampler,
-        reward_fn=reward_fn,
-        config=smc_config,
-    )
-
-    # Run alignment for each test condition
+    # --- Run alignment for each test condition ---
     predictions = {}
-    ctrl_tensor = torch.tensor(ctrl_cells, dtype=torch.float32, device=smc_config.device)
+    ctrl_tensor = torch.tensor(ctrl_cells, dtype=torch.float32)
+    ctrl_expr_tensor = torch.tensor(ctrl_mean, dtype=torch.float32)
 
-    start_time = time.time()
+    start_time_total = time.time()
+
     for i, cond in enumerate(test_conditions):
         print(f"  [{i+1}/{len(test_conditions)}] Aligning: {cond}")
+        t0 = time.time()
 
-        # Encode condition for the base model
-        cond_emb = adapter._encode_condition(cond)
-        cond_emb["num_genes"] = len(gene_names)
+        # Step 1: Build condition for this perturbation
+        condition_dict = adapter.build_condition(
+            perturbation=cond,
+            ctrl_expr=ctrl_expr_tensor,
+            ds_name=ds_name,
+        )
 
+        # Step 2: Get step-by-step sampler
+        sampler = adapter.get_diffusion_sampler(
+            condition_dict=condition_dict,
+            guidance_strength=smc_config.guidance_strength,
+            eta=smc_config.eta,
+            start_time=smc_config.start_timestep or 100,
+        )
+
+        # Step 3: Create SMC engine with this sampler
+        engine = SMCEngine(
+            model_sampler=sampler,
+            reward_fn=reward_fn,
+            config=smc_config,
+        )
+
+        # Step 4: Run SMC-guided generation
+        num_genes = len(gene_names)
         result = engine.sample_with_alignment(
             condition=cond,
-            condition_emb=cond_emb,
-            ctrl_cells=ctrl_tensor,
+            condition_emb=condition_dict,
+            ctrl_cells=ctrl_tensor.to(smc_config.device),
+            num_genes=num_genes,
         )
 
         predictions[cond] = result["samples"].cpu().numpy()
 
-    elapsed = time.time() - start_time
-    print(f"[CellDiffA] Alignment completed in {elapsed:.1f}s")
+        t1 = time.time()
+        ess_final = result["ess_history"][-1] if result["ess_history"] else 0
+        n_resamples = sum(result["resample_history"])
+        print(
+            f"    Done in {t1-t0:.1f}s | "
+            f"Final ESS: {ess_final:.1f}/{smc_config.num_particles} | "
+            f"Resampled: {n_resamples}/{len(result['resample_history'])} steps"
+        )
 
+    elapsed = time.time() - start_time_total
+    print(f"\n[CellDiffA] All conditions aligned in {elapsed:.1f}s")
+
+    # --- Evaluate ---
     aggregated, per_condition = evaluate_all_conditions(
         predictions=predictions,
         ground_truth=ground_truth,
@@ -186,9 +222,11 @@ def main():
     parser.add_argument("--celldiffa", action="store_true", help="Enable CellDiffA alignment")
     parser.add_argument("--num_particles", type=int, default=None, help="Override num_particles")
     parser.add_argument("--tempering", type=str, default=None, help="Override tempering schedule")
+    parser.add_argument("--alpha", type=float, default=None, help="Override reward temperature")
     parser.add_argument("--n_samples", type=int, default=100, help="Samples per condition")
     parser.add_argument("--output_dir", type=str, default="./results", help="Output directory")
     parser.add_argument("--device", type=str, default="cuda", help="Device")
+    parser.add_argument("--ds_name", type=str, default="norman", help="Dataset name for gene emb")
     args = parser.parse_args()
 
     # Load config
@@ -199,9 +237,13 @@ def main():
         config["smc"]["num_particles"] = args.num_particles
     if args.tempering:
         config["smc"]["tempering_schedule"] = args.tempering
+    if args.alpha:
+        config["smc"]["alpha"] = args.alpha
     config["training"]["device"] = args.device
 
-    # Setup data
+    # ================================================================
+    # Setup data (single DataManager instance for the entire pipeline)
+    # ================================================================
     from data.data_manager import PerturbationDataManager
 
     dm = PerturbationDataManager(
@@ -218,8 +260,9 @@ def main():
 
     ctrl_mean = dm.get_control_mean()
     ctrl_cells = dm.get_control_cells(n_cells=200)
+    gene_names = list(dm.adata.var_names)
 
-    # Prepare ground truth
+    # Prepare ground truth from test set
     test_conditions = [
         c for c in adata_test.obs["condition"].unique()
         if c not in ("ctrl", "control")
@@ -233,12 +276,41 @@ def main():
             expr = expr.toarray()
         ground_truth[cond] = expr
 
-    # Load model
-    adapter = get_adapter(args.model, device=args.device)
-    adapter.load_checkpoint(args.checkpoint)
+    print(f"\n[Setup] Dataset: {config['data']['dataset']}")
+    print(f"[Setup] Split: {config['data']['split_strategy']}, fold {config['data']['fold']}")
+    print(f"[Setup] Test conditions: {len(test_conditions)}")
+    print(f"[Setup] Genes: {len(gene_names)}")
 
+    # ================================================================
+    # Pre-compute training-set priors (used by CellDiffA rewards)
+    # ================================================================
+    de_genes = dm.compute_de_genes(
+        top_k=config["rewards"]["rewards"][0].get("top_k", 20)
+    )
+    shifts = dm.compute_perturbation_shifts()
+
+    # ================================================================
+    # Load model
+    # ================================================================
+    adapter = get_adapter(args.model, device=args.device)
+
+    # Load checkpoint with proper context
+    adapter.load_checkpoint(
+        checkpoint_path=args.checkpoint,
+        gene_names=gene_names,
+        ctrl_adata=dm.ctrl_adata,
+    )
+
+    # ================================================================
     # Run evaluation
+    # ================================================================
     if args.celldiffa:
+        if not adapter.is_generative:
+            raise ValueError(
+                f"{args.model} is not a generative (diffusion/flow) model. "
+                f"CellDiffA can only wrap diffusion-based models."
+            )
+
         aggregated, per_condition, predictions = run_celldiffa_evaluation(
             adapter=adapter,
             test_conditions=test_conditions,
@@ -246,19 +318,28 @@ def main():
             ctrl_mean=ctrl_mean,
             ctrl_cells=ctrl_cells,
             config=config,
+            gene_names=gene_names,
+            de_genes=de_genes,
+            shifts=shifts,
+            ds_name=args.ds_name,
         )
         method_name = f"CellDiffA+{args.model}"
     else:
+        # Standard evaluation
+        ctrl_expr_tensor = torch.tensor(ctrl_mean, dtype=torch.float32)
         aggregated, per_condition, predictions = run_standard_evaluation(
             adapter=adapter,
             test_conditions=test_conditions,
             ground_truth=ground_truth,
             ctrl_mean=ctrl_mean,
             n_samples=args.n_samples,
+            ctrl_expr=ctrl_expr_tensor,
         )
         method_name = args.model
 
+    # ================================================================
     # Save results
+    # ================================================================
     os.makedirs(args.output_dir, exist_ok=True)
     result_file = os.path.join(args.output_dir, f"{method_name}_results.json")
 
@@ -266,7 +347,12 @@ def main():
         "method": method_name,
         "dataset": config["data"]["dataset"],
         "split": config["data"]["split_strategy"],
-        "aggregated_metrics": aggregated,
+        "fold": config["data"]["fold"],
+        "config": {
+            "smc": config["smc"] if args.celldiffa else None,
+            "rewards": config["rewards"] if args.celldiffa else None,
+        },
+        "aggregated_metrics": {k: float(v) for k, v in aggregated.items()},
         "per_condition_metrics": {
             k: {mk: float(mv) for mk, mv in v.items()}
             for k, v in per_condition.items()
@@ -276,12 +362,20 @@ def main():
     with open(result_file, "w") as f:
         json.dump(output, f, indent=2)
 
+    # Optionally save raw predictions
+    if config["logging"].get("save_predictions", False):
+        pred_file = os.path.join(args.output_dir, f"{method_name}_predictions.npz")
+        np.savez_compressed(pred_file, **predictions)
+        print(f"  Predictions saved to: {pred_file}")
+
     # Print summary
     print(f"\n{'='*60}")
     print(f"  Results: {method_name}")
+    print(f"  Dataset: {config['data']['dataset']} | Split: {config['data']['split_strategy']}")
     print(f"{'='*60}")
     for metric, value in sorted(aggregated.items()):
-        print(f"  {metric:25s}: {value:.4f}")
+        direction = "↑" if "pearson" in metric or "recall" in metric else "↓"
+        print(f"  {metric:25s}: {value:.4f} {direction}")
     print(f"\n  Results saved to: {result_file}")
 
 

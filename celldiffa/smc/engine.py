@@ -1,18 +1,18 @@
 """
 Sequential Monte Carlo (SMC) Engine for Test-Time Alignment.
 
-This is the core of CellDiffA: a plug-and-play wrapper that can be applied on top
-of any pre-trained diffusion model to perform reward-guided sampling at test time,
-without modifying or retraining the base model.
+Core of CellDiffA: a plug-and-play wrapper that applies reward-guided sampling
+on top of any pre-trained diffusion model at test time, without modifying or
+retraining the base model.
 
-The algorithm follows the theoretical framework of Feynman-Kac models applied to
-diffusion processes (Del Moral, 2004; Cardoso et al., ICLR 2025), adapted for
-population-level single-cell perturbation prediction.
+Implements the Feynman-Kac SMC framework from DAS (Kim et al., ICLR 2025),
+adapted for population-level single-cell perturbation prediction.
 
-Key innovations over standard SMC guidance:
-    1. Population-level output: returns a distribution (multiple cells), not a single sample.
-    2. Multi-objective biological rewards with Pareto aggregation.
-    3. Annealed tempering schedule adapted for gene expression space.
+Key design decisions:
+    1. Incremental weight update (DAS-style): w_t ∝ exp((β_t - β_{t-1}) * r(x̂_0) / α)
+    2. Population-level output: returns a distribution (batch of cells), not a single sample.
+    3. Multi-objective biological rewards with optional Pareto aggregation.
+    4. Adaptive or linear tempering schedule.
 """
 
 from dataclasses import dataclass, field
@@ -42,6 +42,7 @@ class DiffusionSamplerProtocol(Protocol):
         x_t: torch.Tensor,
         t: torch.Tensor,
         condition: Dict[str, torch.Tensor],
+        prev_pred: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Perform one reverse diffusion step.
@@ -50,12 +51,12 @@ class DiffusionSamplerProtocol(Protocol):
             x_t: Noisy samples at timestep t. Shape: (batch_size, num_genes)
             t: Current timestep tensor. Shape: (batch_size,)
             condition: Conditioning information (perturbation embedding, etc.)
+            prev_pred: Previous x0 prediction for self-conditioning. Shape: (batch_size, num_genes)
 
         Returns:
             Dict containing:
                 - "x_prev": Denoised sample at t-1. Shape: (batch_size, num_genes)
-                - "x0_pred": Tweedie estimate of clean sample. Shape: (batch_size, num_genes)
-                - "noise_pred": Predicted noise (optional). Shape: (batch_size, num_genes)
+                - "x0_pred": Tweedie/direct estimate of clean sample. Shape: (batch_size, num_genes)
         """
         ...
 
@@ -88,18 +89,30 @@ class SMCConfig:
     ess_threshold: float = 0.5
     """Effective Sample Size threshold (fraction of N) to trigger resampling."""
 
-    # Tempering / Annealing
+    # Tempering / Annealing (DAS-style)
     tempering_schedule: str = "linear"
-    """How to anneal reward influence: 'linear', 'cosine', 'constant'."""
+    """How β_t grows from 0 to 1: 'linear', 'cosine', 'adaptive'."""
 
-    initial_temperature: float = 0.1
-    """Temperature at t=T (start of reverse process). Low = weak guidance."""
+    alpha: float = 1.0
+    """Reward temperature α: controls reward-KL tradeoff in p_tar ∝ p_pre * exp(r/α).
+    Smaller α = stronger reward influence. DAS default: 1.0."""
 
-    final_temperature: float = 1.0
-    """Temperature at t=0 (end of reverse process). High = strong guidance."""
+    # Sampling
+    start_timestep: Optional[int] = None
+    """If set, start reverse process from this timestep instead of T-1.
+    PerturbDiff default uses start_time=100 for DDIM."""
+
+    use_ddim: bool = True
+    """Whether to use DDIM (deterministic) or DDPM (stochastic) steps."""
+
+    eta: float = 0.0
+    """DDIM noise scale. 0 = deterministic."""
+
+    guidance_strength: float = 1.0
+    """Classifier-free guidance strength for the base model."""
 
     # Output aggregation
-    output_mode: str = "weighted_mean"
+    output_mode: str = "all"
     """How to aggregate final particles: 'weighted_mean', 'top_k', 'all'."""
 
     top_k: int = 50
@@ -119,9 +132,11 @@ class SMCEngine:
     """
     Sequential Monte Carlo engine for test-time alignment of diffusion models.
 
-    This engine wraps a pre-trained diffusion model and applies reward-guided
-    importance weighting and resampling at each denoising step, steering the
-    generated cell population toward biologically plausible distributions.
+    Implements DAS-style incremental importance weighting:
+        log w_t^(n) += (β_t - β_{t-1}) * r(x̂_0^(n)) / α
+
+    where β_t is the tempering coefficient at step t, r is the composite
+    biological reward, and α is the reward temperature.
 
     Usage:
         >>> engine = SMCEngine(model_sampler, reward_fn, config)
@@ -153,6 +168,7 @@ class SMCEngine:
         condition: str,
         condition_emb: Dict[str, torch.Tensor],
         ctrl_cells: Optional[torch.Tensor] = None,
+        num_genes: Optional[int] = None,
         return_trajectory: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
@@ -164,6 +180,7 @@ class SMCEngine:
             condition: Perturbation condition string (e.g., "GeneA+GeneB").
             condition_emb: Conditioning tensors for the diffusion model.
             ctrl_cells: Control cell expressions for reference. Shape: (M, G)
+            num_genes: Number of genes (inferred from ctrl_cells if not given).
             return_trajectory: If True, also return intermediate states.
 
         Returns:
@@ -171,25 +188,41 @@ class SMCEngine:
                 - "samples": Final generated cell expressions. Shape depends on output_mode.
                 - "weights": Final normalized particle weights. Shape: (N,)
                 - "ess_history": ESS values at each timestep.
+                - "resample_history": Boolean list indicating when resampling occurred.
                 - "trajectory": (optional) List of intermediate particle states.
         """
         N = self.config.num_particles
         T = self.model.num_timesteps
 
-        # Step 0: Initialize particles as pure noise
-        x_t = self.model.sample_noise(
-            shape=(N, condition_emb.get("num_genes", ctrl_cells.shape[1] if ctrl_cells is not None else 2000)),
-            device=self.device,
-        )
+        # Determine gene dimension
+        G = num_genes or (ctrl_cells.shape[1] if ctrl_cells is not None else None)
+        if G is None:
+            raise ValueError("Must provide either ctrl_cells or num_genes.")
 
-        # Initialize uniform log-weights
+        # Determine start timestep
+        start_t = self.config.start_timestep if self.config.start_timestep is not None else (T - 1)
+        start_t = min(start_t, T - 1)
+
+        # Step 0: Initialize particles as pure noise
+        x_t = self.model.sample_noise(shape=(N, G), device=self.device)
+
+        # Initialize log-weights to zero (uniform)
         log_weights = torch.zeros(N, device=self.device)
+
+        # Self-conditioning: track previous x0 prediction
+        prev_pred = torch.zeros(N, G, device=self.device)
+
+        # Tracking
         ess_history = []
+        resample_history = []
         trajectory = [] if return_trajectory else None
 
-        # Reverse diffusion loop: t = T-1, T-2, ..., 0
-        timesteps = list(range(T - 1, -1, -1))
+        # Build tempering schedule: β values from 0 to 1
+        timesteps = list(range(start_t, -1, -1))
+        num_steps = len(timesteps)
+        beta_schedule = self._build_tempering_schedule(num_steps)
 
+        # Reverse diffusion loop
         for step_idx, t in enumerate(timesteps):
             t_tensor = torch.full((N,), t, device=self.device, dtype=torch.long)
 
@@ -197,28 +230,35 @@ class SMCEngine:
             # Step 1: Parallel denoising (black-box model call)
             # ----------------------------------------------------------
             with torch.no_grad():
-                output = self._batched_denoise(x_t, t_tensor, condition_emb)
+                output = self._batched_denoise(x_t, t_tensor, condition_emb, prev_pred)
 
             x_prev = output["x_prev"]       # (N, G) - denoised one step
-            x0_pred = output["x0_pred"]      # (N, G) - Tweedie estimate
+            x0_pred = output["x0_pred"]      # (N, G) - x_start prediction
+
+            # Update self-conditioning state
+            prev_pred = x0_pred.clone()
 
             # ----------------------------------------------------------
-            # Step 2: Compute rewards on Tweedie estimate
+            # Step 2: Compute rewards on x0 prediction
             # ----------------------------------------------------------
             rewards = self.reward_fn.compute(
                 x_pred=x0_pred,
                 condition=condition,
                 timestep=t,
                 ctrl_cells=ctrl_cells,
-            )  # (N,)
+            )  # (N,) scalar reward per particle
 
             # ----------------------------------------------------------
-            # Step 3: Update importance weights with annealed temperature
+            # Step 3: Incremental weight update (DAS-style)
+            #   log w_t += (β_t - β_{t-1}) * r / α
             # ----------------------------------------------------------
-            temperature = self._get_temperature(step_idx, len(timesteps))
-            log_weights = log_weights + temperature * rewards
+            beta_t = beta_schedule[step_idx]
+            beta_prev = beta_schedule[step_idx - 1] if step_idx > 0 else 0.0
+            delta_beta = beta_t - beta_prev
 
-            # Normalize weights
+            log_weights = log_weights + (delta_beta / self.config.alpha) * rewards
+
+            # Normalize weights for ESS computation
             log_weights_normalized = log_weights - torch.logsumexp(log_weights, dim=0)
             weights = torch.exp(log_weights_normalized)
 
@@ -229,11 +269,16 @@ class SMCEngine:
             # ----------------------------------------------------------
             # Step 3b: Conditional resampling (if ESS drops below threshold)
             # ----------------------------------------------------------
+            did_resample = False
             if ess < self.config.ess_threshold * N:
                 indices = self.resampler.resample(weights, N)
                 x_prev = x_prev[indices]
+                prev_pred = prev_pred[indices]
                 log_weights = torch.zeros(N, device=self.device)  # Reset weights
-            
+                did_resample = True
+
+            resample_history.append(did_resample)
+
             # Update particles
             x_t = x_prev
 
@@ -252,6 +297,7 @@ class SMCEngine:
             "samples": output_samples,
             "weights": final_weights.cpu(),
             "ess_history": ess_history,
+            "resample_history": resample_history,
             "all_particles": x_t.cpu(),
         }
         if return_trajectory:
@@ -263,26 +309,65 @@ class SMCEngine:
     # Private methods
     # ------------------------------------------------------------------
 
+    def _build_tempering_schedule(self, num_steps: int) -> List[float]:
+        """
+        Build the tempering schedule β_0, β_1, ..., β_{T-1}.
+
+        β goes from 0 to 1 over the reverse process.
+        At step 0 (t=T-1, high noise), β≈0 → weak reward influence.
+        At final step (t=0, clean), β=1 → full reward influence.
+
+        This follows DAS Eq. (7): incremental tempering ensures
+        importance weights have bounded variance.
+        """
+        if num_steps <= 1:
+            return [1.0]
+
+        schedule = self.config.tempering_schedule
+
+        if schedule == "linear":
+            # β_k = k / (num_steps - 1)
+            return [k / (num_steps - 1) for k in range(num_steps)]
+
+        elif schedule == "cosine":
+            # Cosine schedule: slower at start, faster at end
+            return [
+                0.5 * (1 - np.cos(np.pi * k / (num_steps - 1)))
+                for k in range(num_steps)
+            ]
+
+        elif schedule == "adaptive":
+            # Placeholder for adaptive tempering (to be implemented)
+            # In adaptive mode, β_t is chosen so that ESS stays above threshold.
+            # For now, fall back to linear.
+            return [k / (num_steps - 1) for k in range(num_steps)]
+
+        else:
+            raise ValueError(f"Unknown tempering schedule: {schedule}")
+
     def _batched_denoise(
         self,
         x_t: torch.Tensor,
         t: torch.Tensor,
         condition_emb: Dict[str, torch.Tensor],
+        prev_pred: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         """
         Denoise particles in batches to manage GPU memory.
+
+        Handles expanding condition tensors to match batch size.
         """
         N = x_t.shape[0]
         bs = self.config.batch_size_per_step
 
         if N <= bs:
-            return self.model.denoise_step(x_t, t, condition_emb)
+            return self.model.denoise_step(x_t, t, condition_emb, prev_pred=prev_pred)
 
         outputs = {"x_prev": [], "x0_pred": []}
         for i in range(0, N, bs):
             end = min(i + bs, N)
             batch_out = self.model.denoise_step(
-                x_t[i:end], t[i:end], condition_emb
+                x_t[i:end], t[i:end], condition_emb, prev_pred=prev_pred[i:end]
             )
             outputs["x_prev"].append(batch_out["x_prev"])
             outputs["x0_pred"].append(batch_out["x0_pred"])
@@ -291,28 +376,6 @@ class SMCEngine:
             "x_prev": torch.cat(outputs["x_prev"], dim=0),
             "x0_pred": torch.cat(outputs["x0_pred"], dim=0),
         }
-
-    def _get_temperature(self, step_idx: int, total_steps: int) -> float:
-        """
-        Compute annealing temperature for the current step.
-
-        The temperature controls how strongly rewards influence particle weights.
-        It increases over the reverse process: weak guidance at high noise levels
-        (where Tweedie estimates are unreliable), strong guidance at low noise.
-        """
-        progress = step_idx / max(total_steps - 1, 1)  # 0 -> 1
-
-        t_init = self.config.initial_temperature
-        t_final = self.config.final_temperature
-
-        if self.config.tempering_schedule == "linear":
-            return t_init + (t_final - t_init) * progress
-        elif self.config.tempering_schedule == "cosine":
-            return t_init + (t_final - t_init) * (1 - np.cos(np.pi * progress)) / 2
-        elif self.config.tempering_schedule == "constant":
-            return t_final
-        else:
-            raise ValueError(f"Unknown schedule: {self.config.tempering_schedule}")
 
     def _aggregate_output(
         self, particles: torch.Tensor, weights: torch.Tensor
