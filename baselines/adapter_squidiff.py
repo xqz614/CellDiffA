@@ -153,9 +153,11 @@ class SquidiffSampler:
 
         pred_xstart = (x_t - sqrt_one_minus_alpha * eps_pred) / sqrt_alpha
 
-        # Clip x0_pred (Squidiff clips to [0, +inf) for gene expression)
-        if self.clip_denoised:
-            pred_xstart = pred_xstart.clamp(min=0.0)
+        # Squidiff ALWAYS clips x0_pred to [0, +inf) for gene expression
+        # (In Squidiff source: process_xstart returns x.clamp(0,) when clip_denoised=False)
+        # The clip_denoised flag in Squidiff means clip to [-1,1] (for images),
+        # while default behavior is always [0, +inf) for gene expression.
+        pred_xstart = pred_xstart.clamp(min=0.0)
 
         # DDIM step
         alpha_bar_prev = self.alphas_cumprod_prev[t].unsqueeze(1)  # (N, 1)

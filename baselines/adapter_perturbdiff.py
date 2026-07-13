@@ -167,20 +167,20 @@ class PerturbDiffSampler:
         with torch.no_grad():
             output = self.model(x_input, control_input, t_input, self_condition=model_cond)
 
-        # Model output is x_start prediction
+        # Model output is x_start prediction (raw, NOT clipped yet)
         model_output = output["x"]  # (N, 1, G)
         model_output = model_output.squeeze(1)  # (N, G)
 
-        # Apply clipping (PerturbDiff clips values below cutoff to 0)
-        if self.clip_denoised:
-            cutoff = getattr(self.model.model_cfg, 'cutoff', 0.0)
-            model_output = model_output.masked_fill(model_output < cutoff, 0.0)
+        # NOTE: In PerturbDiff source, process_xstart (clipping) is applied AFTER CFG.
+        # We must NOT clip before CFG computation.
+        cutoff = getattr(self.model.model_cfg, 'cutoff', 0.0) if self.clip_denoised else 0.0
 
-        pred_xstart = model_output
+        pred_xstart = model_output  # raw, unclipped
 
         # --- Classifier-free guidance ---
         if self.guidance_strength != 0.0:
             # Unconditional forward: only gene_emb + ds_name (drop batch_emb)
+            # This matches PerturbDiff source: self_condition={"gene_emb": ..., "ds_name": ...}
             uncond_cond = {
                 "gene_emb": gene_emb,
                 "ds_name": cond["ds_name"],
@@ -189,9 +189,7 @@ class PerturbDiffSampler:
                 uncond_output = self.model(
                     x_input, control_input, t_input, self_condition=uncond_cond
                 )
-            uncond_xstart = uncond_output["x"].squeeze(1)
-            if self.clip_denoised:
-                uncond_xstart = uncond_xstart.masked_fill(uncond_xstart < cutoff, 0.0)
+            uncond_xstart = uncond_output["x"].squeeze(1)  # raw, unclipped
 
             # Guided prediction in epsilon space
             # eps_cond = (x_t - sqrt(alpha_t) * pred_xstart) / sqrt(1-alpha_t)
@@ -205,8 +203,10 @@ class PerturbDiffSampler:
 
             # Convert back to x_start
             pred_xstart = (x_t - sqrt_one_minus_alpha * eps_guided) / sqrt_alpha
-            if self.clip_denoised:
-                pred_xstart = pred_xstart.masked_fill(pred_xstart < cutoff, 0.0)
+
+        # Apply clipping AFTER CFG (matches PerturbDiff source: process_xstart after guidance)
+        if self.clip_denoised:
+            pred_xstart = pred_xstart.masked_fill(pred_xstart < cutoff, 0.0)
 
         # --- DDIM step ---
         alpha_bar = self.alphas_cumprod[t].unsqueeze(1)  # (N, 1)
