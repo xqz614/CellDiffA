@@ -9,10 +9,12 @@ Note: GEARS produces a single point estimate per condition (not a distribution).
 """
 
 import os
-from typing import Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import numpy as np
-from anndata import AnnData
+
+if TYPE_CHECKING:
+    from anndata import AnnData
 
 from .base_adapter import BaseAdapter
 
@@ -42,8 +44,8 @@ class GEARSAdapter(BaseAdapter):
 
     def fit(
         self,
-        adata_train: AnnData,
-        adata_val: Optional[AnnData] = None,
+        adata_train: "AnnData",
+        adata_val: Optional["AnnData"] = None,
         epochs: int = 20,
         batch_size: int = 32,
         lr: float = 1e-3,
@@ -76,10 +78,7 @@ class GEARSAdapter(BaseAdapter):
             dataset_name="custom",
             adata=adata_train,
         )
-        self._pert_data.prepare_split(
-            split="custom",
-            seed=self.seed,
-        )
+        self._pert_data.prepare_split(split="simulation", seed=self.seed)
         self._pert_data.get_dataloader(batch_size=batch_size, test_batch_size=batch_size)
 
         # Initialize and train model
@@ -115,25 +114,43 @@ class GEARSAdapter(BaseAdapter):
 
         results = {}
         for cond in conditions:
-            # GEARS predict interface
-            pred = self._model.predict([cond])
-            pred_expr = pred["pred"].flatten()  # (num_genes,)
+            genes = [g for g in cond.split("+") if g not in {"ctrl", "control"}]
+            if not genes:
+                raise ValueError(f"Invalid perturbation condition: {cond!r}")
+            pred = self._model.predict([genes])
+            pred_expr = np.asarray(pred["_".join(genes)]).reshape(-1)
 
             # Repeat for n_samples (deterministic model)
             results[cond] = np.tile(pred_expr, (n_samples, 1))
 
         return results
 
-    def load_checkpoint(self, path: str) -> None:
-        """Load pre-trained GEARS model."""
+    def load_checkpoint(
+        self,
+        checkpoint_path: str,
+        gene_names=None,
+        ctrl_adata=None,
+        adata_train=None,
+        dataset_name: str = "custom",
+        **kwargs,
+    ) -> None:
+        """Load a GEARS checkpoint with the matching processed AnnData."""
         try:
             from gears import GEARS, PertData
         except ImportError:
             raise ImportError("GEARS not installed.")
 
+        if adata_train is None:
+            raise ValueError(
+                "GEARS checkpoint loading requires adata_train to reconstruct "
+                "the gene and perturbation graphs."
+            )
         self._pert_data = PertData(self.data_path)
+        self._pert_data.new_data_process(dataset_name=dataset_name, adata=adata_train)
+        self._pert_data.prepare_split(split="simulation", seed=self.seed)
+        self._pert_data.get_dataloader(batch_size=32, test_batch_size=32)
         self._model = GEARS(self._pert_data, device=self.device)
-        self._model.load_pretrained(path)
+        self._model.load_pretrained(checkpoint_path)
         self.is_trained = True
 
     def save_checkpoint(self, path: str) -> None:

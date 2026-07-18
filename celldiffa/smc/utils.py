@@ -1,8 +1,9 @@
 """Utility functions for the SMC engine."""
 
-import torch
-import numpy as np
 from typing import Dict, List
+
+import numpy as np
+import torch
 
 
 def compute_ess(log_weights: torch.Tensor) -> float:
@@ -20,7 +21,7 @@ def compute_ess(log_weights: torch.Tensor) -> float:
     """
     log_w_norm = log_weights - torch.logsumexp(log_weights, dim=0)
     weights = torch.exp(log_w_norm)
-    return (1.0 / (weights ** 2).sum()).item()
+    return (1.0 / (weights**2).sum()).item()
 
 
 def log_mean_exp(log_values: torch.Tensor, dim: int = 0) -> torch.Tensor:
@@ -67,10 +68,10 @@ def build_reward_from_config(
         CompositeReward instance.
     """
     from celldiffa.rewards import (
-        CompositeReward,
-        TranscriptomicReward,
-        GeometricReward,
         AnchorReward,
+        CompositeReward,
+        GeometricReward,
+        TranscriptomicReward,
     )
 
     reward_instances = []
@@ -101,13 +102,18 @@ def build_reward_from_config(
         elif r_type == "anchor":
             reward_instances.append(
                 AnchorReward(
-                    ctrl_mean=ctrl_mean,
+                    perturbation_shifts=shifts,
                     weight=weight,
-                    max_distance=r_cfg.get("max_distance", None),
+                    bandwidth=r_cfg.get("bandwidth", 1.0),
                 )
             )
         else:
             raise ValueError(f"Unknown reward type: {r_type}")
 
     aggregation = config.get("aggregation", "linear")
-    return CompositeReward(rewards=reward_instances, aggregation=aggregation)
+    normalization = config.get("normalization", "zscore")
+    return CompositeReward(
+        rewards=reward_instances,
+        aggregation=aggregation,
+        normalization=normalization,
+    )
