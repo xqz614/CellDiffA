@@ -13,8 +13,8 @@ Usage:
     python scripts/evaluate_model.py --model perturbdiff --checkpoint ./checkpoints/pd \
         --celldiffa --num_particles 100
 
-    # CellDiffA on top of scDFM
-    python scripts/evaluate_model.py --model scdfm --checkpoint ./checkpoints/scdfm \
+    # Alternative tempering schedule
+    python scripts/evaluate_model.py --model perturbdiff --checkpoint ./checkpoints/pd \
         --celldiffa --num_particles 200 --tempering cosine
 """
 
@@ -40,18 +40,11 @@ def load_config(config_path: str) -> dict:
 
 def get_adapter(model_name: str, device: str, **kwargs):
     """Factory function to instantiate the correct adapter."""
-    from baselines import (
-        GEARSAdapter, CPAAdapter, PerturbDiffAdapter, ScDFMAdapter,
-        SquidiffAdapter, CellFlowAdapter,
-    )
+    from baselines import GEARSAdapter, PerturbDiffAdapter
 
     adapters = {
         "gears": GEARSAdapter,
-        "cpa": CPAAdapter,
         "perturbdiff": PerturbDiffAdapter,
-        "scdfm": ScDFMAdapter,
-        "squidiff": SquidiffAdapter,
-        "cellflow": CellFlowAdapter,
     }
 
     if model_name not in adapters:
@@ -67,6 +60,7 @@ def run_standard_evaluation(
     ctrl_mean: np.ndarray,
     n_samples: int = 100,
     ctrl_expr: Optional[torch.Tensor] = None,
+    adapter_kwargs: Optional[dict] = None,
 ) -> tuple:
     """Run standard (non-CellDiffA) evaluation."""
     from celldiffa.evaluation import evaluate_all_conditions
@@ -78,6 +72,7 @@ def run_standard_evaluation(
         conditions=test_conditions,
         n_samples=n_samples,
         ctrl_expr=ctrl_expr,
+        **(adapter_kwargs or {}),
     )
 
     elapsed = time.time() - start_time
@@ -103,6 +98,8 @@ def run_celldiffa_evaluation(
     de_genes: Dict[str, List[str]],
     shifts: Dict[str, np.ndarray],
     ds_name: str = "norman",
+    cell_type: str = "K562",
+    batch_name: str = "default",
 ) -> tuple:
     """
     Run CellDiffA test-time alignment evaluation.
@@ -115,9 +112,9 @@ def run_celldiffa_evaluation(
             4. Run SMC engine to generate aligned samples
             5. Evaluate against ground truth
     """
-    from celldiffa.smc import SMCEngine, SMCConfig
-    from celldiffa.smc.utils import build_reward_from_config
     from celldiffa.evaluation import evaluate_all_conditions
+    from celldiffa.smc import SMCConfig, SMCEngine
+    from celldiffa.smc.utils import build_reward_from_config
 
     print(f"\n[CellDiffA] Running SMC test-time alignment on {adapter.model_name}...")
 
@@ -134,6 +131,7 @@ def run_celldiffa_evaluation(
     smc_cfg = config["smc"]
     smc_config = SMCConfig(
         num_particles=smc_cfg["num_particles"],
+        cells_per_particle=smc_cfg["cells_per_particle"],
         resampling_strategy=smc_cfg["resampling_strategy"],
         ess_threshold=smc_cfg["ess_threshold"],
         tempering_schedule=smc_cfg["tempering_schedule"],
@@ -146,23 +144,26 @@ def run_celldiffa_evaluation(
         top_k=smc_cfg["top_k"],
         device=config["training"]["device"],
         batch_size_per_step=smc_cfg["batch_size_per_step"],
+        seed=smc_cfg.get("seed", config["data"]["seed"]),
     )
 
     # --- Run alignment for each test condition ---
     predictions = {}
     ctrl_tensor = torch.tensor(ctrl_cells, dtype=torch.float32)
-    ctrl_expr_tensor = torch.tensor(ctrl_mean, dtype=torch.float32)
 
     start_time_total = time.time()
 
     for i, cond in enumerate(test_conditions):
-        print(f"  [{i+1}/{len(test_conditions)}] Aligning: {cond}")
+        print(f"  [{i + 1}/{len(test_conditions)}] Aligning: {cond}")
         t0 = time.time()
 
         # Step 1: Build condition for this perturbation
+        condition_ctrl = ctrl_tensor[: smc_config.cells_per_particle].to(smc_config.device)
         condition_dict = adapter.build_condition(
             perturbation=cond,
-            ctrl_expr=ctrl_expr_tensor,
+            cell_type=cell_type,
+            batch_name=batch_name,
+            ctrl_expr=condition_ctrl,
             ds_name=ds_name,
         )
 
@@ -186,7 +187,7 @@ def run_celldiffa_evaluation(
         result = engine.sample_with_alignment(
             condition=cond,
             condition_emb=condition_dict,
-            ctrl_cells=ctrl_tensor.to(smc_config.device),
+            ctrl_cells=condition_ctrl,
             num_genes=num_genes,
         )
 
@@ -196,7 +197,7 @@ def run_celldiffa_evaluation(
         ess_final = result["ess_history"][-1] if result["ess_history"] else 0
         n_resamples = sum(result["resample_history"])
         print(
-            f"    Done in {t1-t0:.1f}s | "
+            f"    Done in {t1 - t0:.1f}s | "
             f"Final ESS: {ess_final:.1f}/{smc_config.num_particles} | "
             f"Resampled: {n_resamples}/{len(result['resample_history'])} steps"
         )
@@ -221,23 +222,32 @@ def main():
     parser.add_argument("--config", type=str, default="./configs/default.yaml", help="Config file")
     parser.add_argument("--celldiffa", action="store_true", help="Enable CellDiffA alignment")
     parser.add_argument("--num_particles", type=int, default=None, help="Override num_particles")
-    parser.add_argument("--tempering", type=str, default=None, help="Override tempering schedule")
+    parser.add_argument(
+        "--tempering",
+        choices=["linear", "cosine"],
+        default=None,
+        help="Override tempering schedule",
+    )
     parser.add_argument("--alpha", type=float, default=None, help="Override reward temperature")
     parser.add_argument("--n_samples", type=int, default=100, help="Samples per condition")
     parser.add_argument("--output_dir", type=str, default="./results", help="Output directory")
     parser.add_argument("--device", type=str, default="cuda", help="Device")
-    parser.add_argument("--ds_name", type=str, default="norman", help="Dataset name for gene emb")
+    parser.add_argument(
+        "--ds_name", type=str, default=None, help="Dataset name for gene embeddings"
+    )
+    parser.add_argument("--cell_type", type=str, default="K562")
+    parser.add_argument("--batch_name", type=str, default="default")
     args = parser.parse_args()
 
     # Load config
     config = load_config(args.config)
 
     # Override config with CLI args
-    if args.num_particles:
+    if args.num_particles is not None:
         config["smc"]["num_particles"] = args.num_particles
     if args.tempering:
         config["smc"]["tempering_schedule"] = args.tempering
-    if args.alpha:
+    if args.alpha is not None:
         config["smc"]["alpha"] = args.alpha
     config["training"]["device"] = args.device
 
@@ -251,21 +261,24 @@ def main():
         dataset_name=config["data"]["dataset"],
         n_top_genes=config["data"]["n_top_genes"],
         seed=config["data"]["seed"],
+        already_normalized=config["data"].get("already_normalized", True),
     )
     dm.load_and_preprocess()
     adata_train, adata_test = dm.create_split(
         split_strategy=config["data"]["split_strategy"],
         fold=config["data"]["fold"],
+        n_folds=config["data"].get("n_folds", 5),
     )
 
     ctrl_mean = dm.get_control_mean()
-    ctrl_cells = dm.get_control_cells(n_cells=200)
+    ctrl_cells = dm.get_control_cells(
+        n_cells=max(200, args.n_samples, config["smc"]["cells_per_particle"])
+    )
     gene_names = list(dm.adata.var_names)
 
     # Prepare ground truth from test set
     test_conditions = [
-        c for c in adata_test.obs["condition"].unique()
-        if c not in ("ctrl", "control")
+        c for c in adata_test.obs["condition"].unique() if c not in ("ctrl", "control")
     ]
 
     ground_truth = {}
@@ -274,7 +287,7 @@ def main():
         expr = cells.X
         if hasattr(expr, "toarray"):
             expr = expr.toarray()
-        ground_truth[cond] = expr
+        ground_truth[cond] = np.asarray(expr)
 
     print(f"\n[Setup] Dataset: {config['data']['dataset']}")
     print(f"[Setup] Split: {config['data']['split_strategy']}, fold {config['data']['fold']}")
@@ -284,9 +297,7 @@ def main():
     # ================================================================
     # Pre-compute training-set priors (used by CellDiffA rewards)
     # ================================================================
-    de_genes = dm.compute_de_genes(
-        top_k=config["rewards"]["rewards"][0].get("top_k", 20)
-    )
+    de_genes = dm.compute_de_genes(top_k=config["rewards"]["rewards"][0].get("top_k", 20))
     shifts = dm.compute_perturbation_shifts()
 
     # ================================================================
@@ -299,6 +310,8 @@ def main():
         checkpoint_path=args.checkpoint,
         gene_names=gene_names,
         ctrl_adata=dm.ctrl_adata,
+        adata_train=adata_train,
+        dataset_name=config["data"]["dataset"],
     )
 
     # ================================================================
@@ -308,7 +321,7 @@ def main():
         if not adapter.is_generative:
             raise ValueError(
                 f"{args.model} is not a generative (diffusion/flow) model. "
-                f"CellDiffA can only wrap diffusion-based models."
+                f"CellDiffA can only wrap a validated diffusion model."
             )
 
         aggregated, per_condition, predictions = run_celldiffa_evaluation(
@@ -321,12 +334,14 @@ def main():
             gene_names=gene_names,
             de_genes=de_genes,
             shifts=shifts,
-            ds_name=args.ds_name,
+            ds_name=args.ds_name or config["data"]["dataset"],
+            cell_type=args.cell_type,
+            batch_name=args.batch_name,
         )
         method_name = f"CellDiffA+{args.model}"
     else:
         # Standard evaluation
-        ctrl_expr_tensor = torch.tensor(ctrl_mean, dtype=torch.float32)
+        ctrl_expr_tensor = torch.tensor(ctrl_cells[: args.n_samples], dtype=torch.float32)
         aggregated, per_condition, predictions = run_standard_evaluation(
             adapter=adapter,
             test_conditions=test_conditions,
@@ -334,6 +349,11 @@ def main():
             ctrl_mean=ctrl_mean,
             n_samples=args.n_samples,
             ctrl_expr=ctrl_expr_tensor,
+            adapter_kwargs={
+                "cell_type": args.cell_type,
+                "batch_name": args.batch_name,
+                "ds_name": args.ds_name or config["data"]["dataset"],
+            },
         )
         method_name = args.model
 
@@ -354,8 +374,7 @@ def main():
         },
         "aggregated_metrics": {k: float(v) for k, v in aggregated.items()},
         "per_condition_metrics": {
-            k: {mk: float(mv) for mk, mv in v.items()}
-            for k, v in per_condition.items()
+            k: {mk: float(mv) for mk, mv in v.items()} for k, v in per_condition.items()
         },
     }
 
@@ -369,10 +388,10 @@ def main():
         print(f"  Predictions saved to: {pred_file}")
 
     # Print summary
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"  Results: {method_name}")
     print(f"  Dataset: {config['data']['dataset']} | Split: {config['data']['split_strategy']}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     for metric, value in sorted(aggregated.items()):
         direction = "↑" if "pearson" in metric or "recall" in metric else "↓"
         print(f"  {metric:25s}: {value:.4f} {direction}")

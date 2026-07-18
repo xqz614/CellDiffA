@@ -41,7 +41,7 @@ python scripts/preprocess_data.py \
 echo ""
 echo "[Step 2/4] Evaluating Baselines (Standard Inference)..."
 
-BASELINES=("gears" "cpa" "perturbdiff" "scdfm")
+BASELINES=("gears" "perturbdiff")
 
 for MODEL in "${BASELINES[@]}"; do
     CKPT="${CHECKPOINT_DIR}/${MODEL}"
@@ -63,7 +63,7 @@ done
 echo ""
 echo "[Step 3/4] Evaluating CellDiffA Test-Time Alignment..."
 
-DIFFUSION_MODELS=("perturbdiff" "scdfm")
+DIFFUSION_MODELS=("perturbdiff")
 PARTICLE_COUNTS=(50 100 200)
 
 for MODEL in "${DIFFUSION_MODELS[@]}"; do

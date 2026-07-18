@@ -11,17 +11,16 @@ Usage:
 
 import argparse
 import os
+import shutil
 import sys
+from zipfile import BadZipFile, ZipFile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-import scanpy as sc
-import numpy as np
-
 
 # ============================================================
 # Download Functions
 # ============================================================
+
 
 def dataverse_download(url: str, save_path: str) -> None:
     """
@@ -36,19 +35,44 @@ def dataverse_download(url: str, save_path: str) -> None:
         return
 
     print(f"[Download] Downloading from {url}...")
-    response = requests.get(url, stream=True)
+    response = requests.get(url, stream=True, timeout=(30, 300))
     response.raise_for_status()
 
-    total_size = int(response.headers.get('content-length', 0))
+    total_size = int(response.headers.get("content-length", 0))
     block_size = 1024
 
-    progress_bar = tqdm(total=total_size, unit='iB', unit_scale=True)
-    with open(save_path, 'wb') as f:
+    partial_path = f"{save_path}.part"
+    progress_bar = tqdm(total=total_size, unit="iB", unit_scale=True)
+    with open(partial_path, "wb") as f:
         for data in response.iter_content(block_size):
-            progress_bar.update(len(data))
-            f.write(data)
+            if data:
+                progress_bar.update(len(data))
+                f.write(data)
     progress_bar.close()
+    os.replace(partial_path, save_path)
     print(f"[Download] Saved to {save_path}")
+
+
+def extract_h5ad(zip_path: str, output_path: str, preferred_parent: str) -> None:
+    """Safely copy the expected H5AD member without extracting arbitrary paths."""
+    try:
+        with ZipFile(zip_path) as archive:
+            members = [name for name in archive.namelist() if name.lower().endswith(".h5ad")]
+            preferred = [
+                name
+                for name in members
+                if preferred_parent.lower() in name.lower()
+                and name.lower().endswith("perturb_processed.h5ad")
+            ]
+            candidates = preferred or members
+            if len(candidates) != 1:
+                raise RuntimeError(
+                    f"Expected one H5AD in {zip_path}, found {len(candidates)}: {candidates}"
+                )
+            with archive.open(candidates[0]) as source, open(output_path, "wb") as target:
+                shutil.copyfileobj(source, target)
+    except BadZipFile as exc:
+        raise RuntimeError(f"Dataverse response is not a valid ZIP: {zip_path}") from exc
 
 
 def download_norman(data_root: str) -> str:
@@ -63,8 +87,6 @@ def download_norman(data_root: str) -> str:
     Source: https://github.com/snap-stanford/GEARS (preprocessed version)
     Original: Norman et al., Science 2019.
     """
-    from zipfile import ZipFile
-
     raw_dir = os.path.join(data_root, "raw")
     os.makedirs(raw_dir, exist_ok=True)
 
@@ -77,6 +99,7 @@ def download_norman(data_root: str) -> str:
     # Method 1: Try GEARS package (if installed)
     try:
         from gears import PertData
+
         print("[Download] Using GEARS package to download Norman dataset...")
         pert_data = PertData(raw_dir)
         pert_data.load(data_name="norman")
@@ -97,29 +120,9 @@ def download_norman(data_root: str) -> str:
     dataverse_download(url, zip_path)
 
     # Extract zip file (same as GEARS's zip_data_download_wrapper)
-    print("[Download] Extracting zip file...")
-    with ZipFile(zip_path, 'r') as zip_ref:
-        zip_ref.extractall(path=raw_dir)
-
-    # GEARS extracts to: {raw_dir}/norman/perturb_processed.h5ad
-    extracted_path = os.path.join(raw_dir, "norman", "perturb_processed.h5ad")
-    if os.path.exists(extracted_path):
-        # Copy to our standard location
-        import shutil
-        shutil.copy2(extracted_path, output_path)
-        print(f"[Download] Saved to {output_path}")
-    else:
-        # If extraction structure is different, try to find the h5ad file
-        import glob
-        h5ad_files = glob.glob(os.path.join(raw_dir, "**", "*.h5ad"), recursive=True)
-        if h5ad_files:
-            import shutil
-            shutil.copy2(h5ad_files[0], output_path)
-            print(f"[Download] Found and saved to {output_path}")
-        else:
-            # The zip might directly be the h5ad file (some versions)
-            os.rename(zip_path, output_path)
-            print(f"[Download] Saved to {output_path}")
+    print("[Download] Extracting H5AD...")
+    extract_h5ad(zip_path, output_path, preferred_parent="norman")
+    print(f"[Download] Saved to {output_path}")
 
     # Cleanup zip
     if os.path.exists(zip_path):
@@ -135,8 +138,6 @@ def download_replogle(data_root: str) -> str:
     Source: https://github.com/snap-stanford/GEARS
     Original: Replogle et al., Nature Biotechnology 2022.
     """
-    from zipfile import ZipFile
-
     raw_dir = os.path.join(data_root, "raw")
     os.makedirs(raw_dir, exist_ok=True)
     output_path = os.path.join(raw_dir, "replogle_k562.h5ad")
@@ -148,6 +149,7 @@ def download_replogle(data_root: str) -> str:
     # Method 1: Try GEARS
     try:
         from gears import PertData
+
         print("[Download] Using GEARS package to download Replogle dataset...")
         pert_data = PertData(raw_dir)
         pert_data.load(data_name="replogle_k562_essential")
@@ -166,26 +168,9 @@ def download_replogle(data_root: str) -> str:
 
     dataverse_download(url, zip_path)
 
-    print("[Download] Extracting zip file...")
-    with ZipFile(zip_path, 'r') as zip_ref:
-        zip_ref.extractall(path=raw_dir)
-
-    # Find extracted h5ad
-    extracted_path = os.path.join(raw_dir, "replogle_k562_essential", "perturb_processed.h5ad")
-    if os.path.exists(extracted_path):
-        import shutil
-        shutil.copy2(extracted_path, output_path)
-        print(f"[Download] Saved to {output_path}")
-    else:
-        import glob
-        h5ad_files = glob.glob(os.path.join(raw_dir, "**", "*.h5ad"), recursive=True)
-        if h5ad_files:
-            import shutil
-            shutil.copy2(h5ad_files[0], output_path)
-            print(f"[Download] Found and saved to {output_path}")
-        else:
-            os.rename(zip_path, output_path)
-            print(f"[Download] Saved to {output_path}")
+    print("[Download] Extracting H5AD...")
+    extract_h5ad(zip_path, output_path, preferred_parent="replogle_k562_essential")
+    print(f"[Download] Saved to {output_path}")
 
     if os.path.exists(zip_path):
         os.remove(zip_path)
@@ -196,6 +181,7 @@ def download_replogle(data_root: str) -> str:
 # ============================================================
 # Main
 # ============================================================
+
 
 def main():
     parser = argparse.ArgumentParser(description="CellDiffA Data Preprocessing")
@@ -212,19 +198,26 @@ def main():
         "--split",
         type=str,
         default=None,
-        choices=["additive", "combinations", "unseen"],
+        choices=["additive", "unseen"],
         help="Generate a specific split (optional)",
     )
     parser.add_argument("--fold", type=int, default=0, help="Fold index for split")
     parser.add_argument("--n_folds", type=int, default=5, help="Total number of folds")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument(
+        "--raw_counts",
+        action="store_true",
+        help="Normalize/log-transform X; omit for GEARS-distributed log data",
+    )
     parser.add_argument("--compute_priors", action="store_true", help="Compute DE genes and shifts")
     args = parser.parse_args()
+    if args.compute_priors and args.split is None:
+        parser.error("--compute_priors requires --split.")
 
     # Step 1: Download
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"  CellDiffA Data Preprocessing: {args.dataset}")
-    print(f"{'='*60}\n")
+    print(f"{'=' * 60}\n")
 
     if args.dataset == "norman":
         download_norman(args.data_root)
@@ -241,6 +234,7 @@ def main():
         dataset_name=args.dataset,
         n_top_genes=args.n_top_genes,
         seed=args.seed,
+        already_normalized=not args.raw_counts,
     )
     adata = dm.load_and_preprocess()
     print(f"\n[Preprocess] Final AnnData: {adata.n_obs} cells x {adata.n_vars} genes")
@@ -263,9 +257,9 @@ def main():
             shifts = dm.compute_perturbation_shifts()
             print(f"[Priors] Shift vectors computed for {len(shifts)} conditions")
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("  Preprocessing complete!")
-    print(f"{'='*60}\n")
+    print(f"{'=' * 60}\n")
 
 
 if __name__ == "__main__":

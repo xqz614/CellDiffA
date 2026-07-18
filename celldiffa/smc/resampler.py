@@ -6,13 +6,13 @@ These are critical for preventing particle degeneracy (weight collapse).
 """
 
 from enum import Enum
-from typing import Optional
 
 import torch
 
 
 class ResamplingStrategy(Enum):
     """Available resampling strategies."""
+
     MULTINOMIAL = "multinomial"
     SYSTEMATIC = "systematic"
     STRATIFIED = "stratified"

@@ -4,9 +4,10 @@
 
 # --- Data Settings ---
 data:
-  dataset: "norman"                  # Dataset name: norman, replogle_k562, adamson
+  dataset: "norman"                  # Dataset name: norman, replogle_k562
   n_top_genes: 2000                  # Number of highly variable genes
-  split_strategy: "additive"         # Split: additive, combinations, unseen
+  already_normalized: true           # GEARS downloads are log-normalized
+  split_strategy: "additive"         # Split: additive or unseen
   fold: 0
   n_folds: 5
   seed: 42
@@ -14,22 +15,25 @@ data:
 
 # --- SMC Engine Settings (DAS-style) ---
 smc:
-  num_particles: 100                 # Number of SMC particles (generated cells)
+  num_particles: 100                 # Number of distribution-valued particles
+  cells_per_particle: 32             # Cells in each distribution-valued particle
   resampling_strategy: "systematic"  # multinomial, systematic, stratified
   ess_threshold: 0.5                 # ESS fraction to trigger resampling
-  tempering_schedule: "linear"       # linear, cosine, adaptive
+  tempering_schedule: "linear"       # linear or cosine
   alpha: 1.0                         # Reward temperature α (DAS default: 1.0)
   start_timestep: 100                # Reverse process start (PerturbDiff: 100)
   use_ddim: true                     # Use DDIM (deterministic) steps
   eta: 0.0                           # DDIM noise scale (0 = deterministic)
   guidance_strength: 1.0             # CFG strength for base model (PerturbDiff default: 1.0)
-  output_mode: "all"                 # weighted_mean, top_k, all
+  output_mode: "map"                 # map, weighted_mean, top_k, all
   top_k: 50                          # Particles to keep if output_mode=top_k
-  batch_size_per_step: 100           # Max particles per forward pass
+  batch_size_per_step: 256           # Max cells per model forward pass
+  seed: 42
 
 # --- Reward Settings ---
 rewards:
-  aggregation: "linear"              # linear or pareto
+  aggregation: "linear"
+  normalization: "zscore"            # zscore or none; balances reward scales
   rewards:
     - type: "transcriptomic"
       weight: 1.0
@@ -39,7 +43,7 @@ rewards:
       weight: 1.0
     - type: "anchor"
       weight: 1.0
-      max_distance: null             # Optional upper bound (null = no cap)
+      bandwidth: 1.0                 # RBF bandwidth on mean squared gene distance
 
 # --- Evaluation Settings ---
 evaluation:

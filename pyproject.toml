@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "celldiffa"
+version = "0.2.0"
+description = "Population-level SMC test-time alignment for single-cell perturbation generators"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+  "numpy>=1.24",
+  "pandas>=2.0",
+  "scipy>=1.10",
+  "scikit-learn>=1.2",
+  "torch>=2.0",
+  "scanpy>=1.9",
+  "anndata>=0.9",
+  "pyyaml>=6.0",
+  "tqdm>=4.65",
+  "requests>=2.31",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "ruff>=0.6"]
+gears = ["cell-gears"]
+
+[tool.setuptools.packages.find]
+include = ["celldiffa*", "baselines*", "data*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
