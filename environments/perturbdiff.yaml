@@ -1,0 +1,30 @@
+name: celldiffa-perturbdiff
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.9
+  - pip
+  - pytorch=2.5.1
+  - pytorch-cuda=12.1
+  - numpy<2.3
+  - pip:
+      - pytorch-lightning
+      - hydra-core
+      - omegaconf
+      - pandas
+      - scipy
+      - scikit-learn
+      - matplotlib
+      - seaborn
+      - tqdm
+      - anndata
+      - scanpy
+      - h5py
+      - pyyaml
+      - typing-extensions
+      - transformers
+      - timm
+      - geomloss
+      - huggingface-hub[cli]

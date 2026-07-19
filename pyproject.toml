@@ -25,6 +25,7 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest>=8", "ruff>=0.6"]
 gears = ["cell-gears"]
+benchmark = ["cell-eval==0.6.6", "huggingface-hub[cli]>=0.28", "tabulate>=0.9"]
 
 [tool.setuptools.packages.find]
 include = ["celldiffa*", "baselines*", "data*"]

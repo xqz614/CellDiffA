@@ -1,0 +1,109 @@
+# "paper" is the exact PerturbDiff comparison; "extended" comes from DiffA.pdf.
+baselines:
+  mean:
+    tier: paper
+    kind: native
+    runner: end_to_end
+    repository: https://github.com/ArcInstitute/cell-eval
+    revision: 0.6.6
+    datasets: [pbmc, tahoe100m, replogle, norman]
+  linear:
+    tier: paper
+    kind: official_external
+    runner: requires_dataset_adapter
+    repository: https://github.com/const-ae/linear_perturbation_prediction-Paper
+    revision: bfa6eeea2bd145a1af2ec0127a2e808cc38456a9
+    datasets: [pbmc, tahoe100m, replogle, norman]
+  cpa:
+    tier: paper
+    kind: official_external
+    runner: requires_dataset_adapter
+    repository: https://github.com/theislab/cpa
+    revision: fbd7c0250edc23eff003a10c99655579c53afd63
+    datasets: [pbmc, tahoe100m, replogle, norman]
+  state:
+    tier: paper
+    kind: official_external
+    runner: requires_dataset_adapter
+    repository: https://github.com/ArcInstitute/state
+    revision: da4178c930dc917dac6b56faf10a33e21bd8e905
+    datasets: [pbmc, tahoe100m, replogle, norman]
+  cellflow:
+    tier: paper
+    kind: official_external
+    runner: requires_dataset_adapter
+    repository: https://github.com/theislab/CellFlow
+    revision: 446ed6073c60ac2e8db13c4ea096a43cdec288b2
+    datasets: [pbmc, tahoe100m, replogle, norman]
+  squidiff:
+    tier: paper
+    kind: official_external
+    runner: requires_dataset_adapter
+    repository: https://github.com/siyuh/Squidiff
+    revision: abdfc27d84947dcccd745d1067c0840a41d32eb8
+    datasets: [pbmc, tahoe100m, replogle, norman]
+  perturbdiff_scratch:
+    tier: paper
+    kind: official_external
+    runner: released_checkpoint_end_to_end
+    repository: https://github.com/DeepGraphLearning/PerturbDiff
+    revision: f4e27c155be5325418c4cb3182453d4022754e91
+    datasets: [pbmc, tahoe100m, replogle]
+  perturbdiff_finetuned:
+    tier: paper
+    kind: official_external
+    runner: released_checkpoint_end_to_end
+    repository: https://github.com/DeepGraphLearning/PerturbDiff
+    revision: f4e27c155be5325418c4cb3182453d4022754e91
+    datasets: [pbmc, tahoe100m, replogle]
+
+  gears:
+    tier: extended
+    kind: official_external
+    runner: requires_dataset_adapter
+    repository: https://github.com/snap-stanford/GEARS
+    revision: f374e43e197b295016d80395d7a54ddb81cc6769
+    # Upstream explicitly does not support multi-cell-type training.
+    datasets: [norman]
+  cellot:
+    tier: extended
+    kind: official_external
+    runner: requires_dataset_adapter
+    repository: https://github.com/bunnech/cellot
+    revision: 522d2b953da8ad244fcf36f64521487fdf763788
+    datasets: [pbmc, tahoe100m]
+  scdfm:
+    tier: extended
+    kind: official_external
+    runner: requires_dataset_adapter
+    repository: https://github.com/AI4Science-WestlakeU/scDFM
+    revision: 2cf6bca1f044e74c4e1dc586892c0495880cf125
+    datasets: [norman]
+  scvi:
+    tier: representation_only
+    kind: not_a_predictor
+    runner: not_applicable
+    repository: https://github.com/scverse/scvi-tools
+    revision: main
+    datasets: []
+  sclambda:
+    tier: extended
+    kind: official_external
+    runner: requires_dataset_adapter
+    repository: https://github.com/gefeiwang/scLAMBDA
+    revision: a5be849797eb26e098c7002b819a5261f51dbead
+    datasets: [norman]
+  scouter:
+    tier: extended
+    kind: official_external
+    runner: requires_dataset_adapter
+    repository: https://github.com/PancakeZoy/scouter
+    revision: bf763aaf87f162fdf28bec3145d254daaddfef84
+    datasets: [norman, replogle]
+  vcworld:
+    tier: extended
+    kind: official_external
+    runner: requires_dataset_adapter
+    repository: https://github.com/GENTEL-lab/VCWorld
+    revision: 0e3c44c25e897d3ebf97b582d63c7fcbf1e80f57
+    datasets: [tahoe100m]

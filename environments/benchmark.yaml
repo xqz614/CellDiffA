@@ -1,0 +1,13 @@
+name: celldiffa-benchmark
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  # Keep Scanpy/Numba on a mutually supported NumPy release.
+  - numpy<2.3
+  - pip
+  - pip:
+      # PerturbDiff Appendix C.2 fixes this exact version.
+      - cell-eval==0.6.6
+      - huggingface-hub[cli]>=0.28
+      - tabulate>=0.9
