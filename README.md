@@ -105,6 +105,10 @@ Splits are deterministic across folds:
 
 The checkpoint and the configured data must use the same ordered gene space.
 
+The reproducible baseline suite, PerturbDiff dataset registry, pinned official
+sources, Conda environments, and exact Cell-Eval 0.6.6 protocol are documented
+in [`docs/BASELINE_BENCHMARK.md`](docs/BASELINE_BENCHMARK.md).
+
 ```bash
 # Native PerturbDiff
 python scripts/evaluate_model.py \
