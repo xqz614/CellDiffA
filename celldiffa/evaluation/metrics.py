@@ -9,13 +9,32 @@ metrics (Energy Distance, MMD, DEG Recall) following the scPerturBench framework
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-from scipy.stats import pearsonr, spearmanr
-from sklearn.metrics import mean_squared_error, r2_score
+from scipy.stats import pearsonr
+from sklearn.metrics import mean_squared_error
+
+
+def _safe_pearson(x: np.ndarray, y: np.ndarray) -> float:
+    """Return a finite correlation for constant or non-finite vectors."""
+    x = np.asarray(x)
+    y = np.asarray(y)
+    if not np.isfinite(x).all() or not np.isfinite(y).all():
+        return 0.0
+    if np.std(x) == 0 or np.std(y) == 0:
+        return 0.0
+    return float(pearsonr(x, y).statistic)
+
+
+def _deterministic_subsample(samples: np.ndarray, max_samples: int = 200) -> np.ndarray:
+    if samples.shape[0] <= max_samples:
+        return samples
+    indices = np.linspace(0, samples.shape[0] - 1, max_samples, dtype=int)
+    return samples[indices]
 
 
 # ============================================================
 # Point-Estimate Metrics (Mean-level)
 # ============================================================
+
 
 def mse_all_genes(pred_mean: np.ndarray, true_mean: np.ndarray) -> float:
     """
@@ -36,8 +55,7 @@ def pearson_all_genes(pred_mean: np.ndarray, true_mean: np.ndarray) -> float:
         pred_mean: Predicted mean expression. Shape: (num_genes,)
         true_mean: True mean expression. Shape: (num_genes,)
     """
-    r, _ = pearsonr(pred_mean, true_mean)
-    return r
+    return _safe_pearson(pred_mean, true_mean)
 
 
 def pearson_delta(
@@ -57,8 +75,7 @@ def pearson_delta(
     """
     pred_delta = pred_mean - ctrl_mean
     true_delta = true_mean - ctrl_mean
-    r, _ = pearsonr(pred_delta, true_delta)
-    return r
+    return _safe_pearson(pred_delta, true_delta)
 
 
 def mse_deg(
@@ -87,13 +104,13 @@ def pearson_deg(
     """
     if len(deg_indices) < 3:
         return 0.0
-    r, _ = pearsonr(pred_mean[deg_indices], true_mean[deg_indices])
-    return r
+    return _safe_pearson(pred_mean[deg_indices], true_mean[deg_indices])
 
 
 # ============================================================
 # Distribution-Level Metrics
 # ============================================================
+
 
 def energy_distance(
     samples_pred: np.ndarray,
@@ -113,14 +130,8 @@ def energy_distance(
     """
     from scipy.spatial.distance import cdist
 
-    # Subsample for computational efficiency
-    max_samples = 200
-    if samples_pred.shape[0] > max_samples:
-        idx = np.random.choice(samples_pred.shape[0], max_samples, replace=False)
-        samples_pred = samples_pred[idx]
-    if samples_true.shape[0] > max_samples:
-        idx = np.random.choice(samples_true.shape[0], max_samples, replace=False)
-        samples_true = samples_true[idx]
+    samples_pred = _deterministic_subsample(samples_pred)
+    samples_true = _deterministic_subsample(samples_true)
 
     # Cross-distribution distances
     d_xy = cdist(samples_pred, samples_true, metric="euclidean").mean()
@@ -129,7 +140,7 @@ def energy_distance(
     d_xx = cdist(samples_pred, samples_pred, metric="euclidean").mean()
     d_yy = cdist(samples_true, samples_true, metric="euclidean").mean()
 
-    return 2 * d_xy - d_xx - d_yy
+    return max(0.0, float(2 * d_xy - d_xx - d_yy))
 
 
 def mmd_rbf(
@@ -149,14 +160,8 @@ def mmd_rbf(
     """
     from scipy.spatial.distance import cdist
 
-    # Subsample
-    max_samples = 200
-    if samples_pred.shape[0] > max_samples:
-        idx = np.random.choice(samples_pred.shape[0], max_samples, replace=False)
-        samples_pred = samples_pred[idx]
-    if samples_true.shape[0] > max_samples:
-        idx = np.random.choice(samples_true.shape[0], max_samples, replace=False)
-        samples_true = samples_true[idx]
+    samples_pred = _deterministic_subsample(samples_pred)
+    samples_true = _deterministic_subsample(samples_true)
 
     # Compute pairwise distances
     d_xx = cdist(samples_pred, samples_pred, metric="sqeuclidean")
@@ -165,18 +170,21 @@ def mmd_rbf(
 
     # Median heuristic for bandwidth
     if bandwidth is None:
-        all_dists = np.concatenate([d_xx.flatten(), d_yy.flatten(), d_xy.flatten()])
-        bandwidth = np.median(all_dists)
-        if bandwidth == 0:
+        all_dists = np.concatenate([d_xx[d_xx > 0], d_yy[d_yy > 0], d_xy[d_xy > 0]])
+        bandwidth = np.median(all_dists) if all_dists.size else 1.0
+        if bandwidth <= 0:
             bandwidth = 1.0
 
     # RBF kernel
-    k_xx = np.exp(-d_xx / (2 * bandwidth)).mean()
-    k_yy = np.exp(-d_yy / (2 * bandwidth)).mean()
+    kernel_xx = np.exp(-d_xx / (2 * bandwidth))
+    kernel_yy = np.exp(-d_yy / (2 * bandwidth))
     k_xy = np.exp(-d_xy / (2 * bandwidth)).mean()
+    n, m = len(samples_pred), len(samples_true)
+    k_xx = (kernel_xx.sum() - np.trace(kernel_xx)) / (n * (n - 1)) if n > 1 else 0.0
+    k_yy = (kernel_yy.sum() - np.trace(kernel_yy)) / (m * (m - 1)) if m > 1 else 0.0
 
     mmd_sq = k_xx + k_yy - 2 * k_xy
-    return max(0.0, mmd_sq)
+    return max(0.0, float(mmd_sq))
 
 
 def deg_recall(
@@ -214,6 +222,7 @@ def deg_recall(
 # Comprehensive Evaluation
 # ============================================================
 
+
 def evaluate_perturbation(
     pred_samples: np.ndarray,
     true_samples: np.ndarray,
@@ -234,6 +243,18 @@ def evaluate_perturbation(
     Returns:
         Dictionary of metric_name -> value.
     """
+    pred_samples = np.asarray(pred_samples)
+    true_samples = np.asarray(true_samples)
+    ctrl_mean = np.asarray(ctrl_mean)
+    if pred_samples.ndim != 2 or true_samples.ndim != 2:
+        raise ValueError("pred_samples and true_samples must have shape (cells, genes).")
+    if pred_samples.shape[0] == 0 or true_samples.shape[0] == 0:
+        raise ValueError("Prediction and ground-truth populations must be non-empty.")
+    if pred_samples.shape[1] != true_samples.shape[1] or ctrl_mean.shape != (
+        pred_samples.shape[1],
+    ):
+        raise ValueError("Prediction, ground truth, and control must share the gene axis.")
+
     pred_mean = pred_samples.mean(axis=0)
     true_mean = true_samples.mean(axis=0)
 
@@ -271,6 +292,12 @@ def evaluate_all_conditions(
     Returns:
         Tuple of (aggregated_metrics, per_condition_metrics).
     """
+    missing = sorted(set(ground_truth) - set(predictions))
+    if missing:
+        raise ValueError(f"Missing predictions for {len(missing)} conditions: {missing[:5]}")
+    if not predictions:
+        raise ValueError("No predictions were provided.")
+
     per_condition = {}
     all_metrics_lists: Dict[str, List[float]] = {}
 

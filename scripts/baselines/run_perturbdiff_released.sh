@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  echo "Usage: $0 DATASET VARIANT OUTPUT_DIR [GPU] [PERTURBDIFF_ROOT]"
+  echo "  DATASET: pbmc | tahoe100m | replogle"
+  echo "  VARIANT: scratch | finetuned"
+}
+
+if [[ $# -lt 3 || $# -gt 5 ]]; then
+  usage >&2
+  exit 2
+fi
+
+dataset="$1"
+variant="$2"
+output_dir="$3"
+gpu="${4:-0}"
+perturbdiff_root="${5:-external/PerturbDiff}"
+data_root="${CELLDIFFA_DATA_ROOT:-/data/users/jchengak/DiffA/CellDiffA/data}"
+perturb_data_root="$data_root/PerturbDiff_data"
+checkpoint_root="$data_root/checkpoints/PerturbDiff_release_ckpt"
+
+case "$dataset" in
+  pbmc)
+    data_config="pbmc_finetune"
+    checkpoint_dataset="pbmc"
+    micro_batch=2048
+    cell_set=256
+    sample_flag="data.sample_pbmc_only=true"
+    extra_covariates=("cov_encoding.celltype_encoding=llm")
+    ;;
+  tahoe100m)
+    data_config="tahoe100m_finetune"
+    checkpoint_dataset="tahoe100m"
+    micro_batch=2048
+    cell_set=256
+    sample_flag="data.sample_tahoe100m_only=true"
+    extra_covariates=("cov_encoding.celltype_encoding=llm")
+    ;;
+  replogle)
+    data_config="replogle_finetune"
+    checkpoint_dataset="replogle"
+    micro_batch=128
+    cell_set=32
+    sample_flag="data.sample_replogle_only=true"
+    extra_covariates=(
+      "cov_encoding.celltype_encoding=llm"
+      "cov_encoding.replogle_gene_encoding=genept"
+    )
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
+
+case "$variant" in
+  scratch) checkpoint="$checkpoint_root/from_scratch_${checkpoint_dataset}.ckpt" ;;
+  finetuned) checkpoint="$checkpoint_root/finetuned_${checkpoint_dataset}.ckpt" ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
+
+entrypoint="$perturbdiff_root/src/apps/run/rawdata_diffusion_sampling.py"
+for required in "$entrypoint" "$checkpoint" "$perturb_data_root"; do
+  if [[ ! -e "$required" ]]; then
+    echo "Missing required path: $required" >&2
+    exit 1
+  fi
+done
+
+mkdir -p "$output_dir"
+export CUDA_VISIBLE_DEVICES="$gpu"
+
+common=(
+  "model_checkpoint_path=$checkpoint"
+  "data=$data_config"
+  "data.normalize_counts=10"
+  "data.num_workers=4"
+  "data.prefetch_factor=16"
+  "data.use_cell_set=$cell_set"
+  "data.keep_control_cell=false"
+  "optimization.micro_batch_size=$micro_batch"
+  "model.hidden_num=[2000,512]"
+  "model.input_dim=2000"
+  "data.pad_length=2000"
+  "data.embed_key=X_hvg"
+  "trainer.devices=[0]"
+  "trainer.use_distributed_sampler=false"
+  "device=cuda:0"
+  "path.tmp_dir=$perturb_data_root"
+  "path.diffusion.save_dir=$output_dir"
+  "path.wandb.logging_dir=$output_dir/wandb"
+  "sampling.output_dir=$output_dir"
+  "sampling.num_sampled_batches=null"
+  "sampling.use_ddim=true"
+  "sampling.start_time=100"
+  "sampling.eta=0.0"
+  "sampling.guidance_strength=1.0"
+  "cov_encoding.batch_encoding=onehot"
+  "model.p_drop_control=0"
+  "$sample_flag"
+  "lightning.logger._target_=pytorch_lightning.loggers.logger.DummyLogger"
+  "~lightning.logger.project"
+  "~lightning.logger.save_dir"
+  "~lightning.logger.name"
+)
+
+python "$entrypoint" "${common[@]}" "${extra_covariates[@]}"

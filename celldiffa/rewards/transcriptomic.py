@@ -53,6 +53,10 @@ class TranscriptomicReward(BaseReward):
             combination_mode: How to combine DEGs for unseen combos. "union" or "intersection".
         """
         super().__init__(weight=weight, name="r_DEG")
+        if top_k < 1:
+            raise ValueError("top_k must be positive.")
+        if combination_mode not in {"union", "intersection"}:
+            raise ValueError("combination_mode must be 'union' or 'intersection'.")
         self.de_genes = de_genes
         self.perturbation_shifts = perturbation_shifts
         self.ctrl_mean = torch.tensor(ctrl_mean, dtype=torch.float32)
@@ -75,7 +79,7 @@ class TranscriptomicReward(BaseReward):
         Compute DEG-based reward for each particle.
 
         Args:
-            x_pred: Tweedie estimate of clean expression. Shape: (N, G)
+            x_pred: Tweedie estimate for each batch particle. Shape: (N, M, G)
             condition: Perturbation condition string.
             timestep: Current diffusion timestep (unused here, reserved for annealing).
 
@@ -90,8 +94,15 @@ class TranscriptomicReward(BaseReward):
         gene_indices = ref["gene_indices"]
         target_expr = ref["target_expr"]
 
-        # Extract predicted expression on reference genes
-        pred_on_ref = x_pred[:, gene_indices]  # (N, K)
+        if x_pred.ndim != 3:
+            raise ValueError(
+                f"TranscriptomicReward expects (particles, cells, genes), got {tuple(x_pred.shape)}"
+            )
+
+        # The signature is defined on the empirical batch mean. Individual
+        # cells remain free to represent heterogeneous response modes.
+        pred_mean = x_pred.mean(dim=1)  # (N, G)
+        pred_on_ref = pred_mean[:, gene_indices]  # (N, K)
 
         # Negative MSE as reward (higher is better)
         mse = ((pred_on_ref - target_expr.unsqueeze(0)) ** 2).mean(dim=1)
@@ -108,11 +119,12 @@ class TranscriptomicReward(BaseReward):
         """
         if condition in self._cache:
             cached = self._cache[condition]
-            return {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                    for k, v in cached.items()}
+            return {
+                k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in cached.items()
+            }
 
         # Case 1: Condition exists directly in training set
-        if condition in self.de_genes:
+        if condition in self.de_genes and condition in self.perturbation_shifts:
             ref = self._build_reference_direct(condition)
         else:
             # Case 2: Unseen combination - decompose and combine
@@ -120,8 +132,7 @@ class TranscriptomicReward(BaseReward):
 
         if ref is not None:
             self._cache[condition] = ref
-            return {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                    for k, v in ref.items()}
+            return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in ref.items()}
         return None
 
     def _build_reference_direct(self, condition: str) -> dict:
@@ -165,6 +176,10 @@ class TranscriptomicReward(BaseReward):
                 if cand in self.de_genes and cand in self.perturbation_shifts:
                     available_parts.append(cand)
                     break
+            else:
+                # A partial reference would bias the combination toward the
+                # constituents that happen to be available.
+                return None
 
         if len(available_parts) == 0:
             return None

@@ -62,7 +62,7 @@ class GeometricReward(BaseReward):
         Compute geometric alignment reward for each particle.
 
         Args:
-            x_pred: Tweedie estimate of clean expression. Shape: (N, G)
+            x_pred: Tweedie estimate for each batch particle. Shape: (N, M, G)
             condition: Perturbation condition string.
             timestep: Current diffusion timestep.
 
@@ -73,9 +73,14 @@ class GeometricReward(BaseReward):
         if ref_dir is None:
             return torch.zeros(x_pred.shape[0], device=x_pred.device)
 
-        # Compute predicted shift direction
+        if x_pred.ndim != 3:
+            raise ValueError(
+                f"GeometricReward expects (particles, cells, genes), got {tuple(x_pred.shape)}"
+            )
+
+        # Compute predicted population-mean shift direction.
         ctrl = self.ctrl_mean.to(x_pred.device)
-        delta_pred = x_pred - ctrl.unsqueeze(0)  # (N, G)
+        delta_pred = x_pred.mean(dim=1) - ctrl.unsqueeze(0)  # (N, G)
 
         # Normalize predicted directions
         pred_norm = torch.norm(delta_pred, dim=1, keepdim=True).clamp(min=self.min_shift_norm)

@@ -1,6 +1,6 @@
 """SMC test-time alignment engine for CellDiffA."""
 
-from .engine import SMCEngine, SMCConfig, DiffusionSamplerProtocol
+from .engine import DiffusionSamplerProtocol, SMCConfig, SMCEngine
 from .resampler import Resampler, ResamplingStrategy
 
 __all__ = [

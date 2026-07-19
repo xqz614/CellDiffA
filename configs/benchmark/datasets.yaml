@@ -1,0 +1,41 @@
+# Paths are resolved after environment-variable expansion. Keep data outside Git.
+data_root: ${CELLDIFFA_DATA_ROOT:-/data/users/jchengak/DiffA/CellDiffA/data}
+
+datasets:
+  pbmc:
+    family: cytokine
+    source: PerturbDiff
+    path: ${CELLDIFFA_DATA_ROOT:-/data/users/jchengak/DiffA/CellDiffA/data}/PerturbDiff_data/finetune_data/pbmc_new/Parse_10M_PBMC_cytokines_processed_Xselected.h5ad
+    pert_col: cytokine
+    context_col: cell_type
+    batch_col: donor
+    control_pert: PBS
+    expression_key: X_hvg
+  tahoe100m:
+    family: drug
+    source: PerturbDiff
+    # PerturbDiff stores Tahoe as a directory of per-plate H5AD files.
+    path: ${CELLDIFFA_DATA_ROOT:-/data/users/jchengak/DiffA/CellDiffA/data}/PerturbDiff_data/finetune_data/tahoe100m_full_selected_processed_new
+    pert_col: drugname_drugconc
+    context_col: cell_line
+    batch_col: plate
+    control_pert: "[('DMSO_TF', 0.0, 'uM')]"
+    expression_key: X_hvg
+  replogle:
+    family: genetic
+    source: PerturbDiff
+    path: ${CELLDIFFA_DATA_ROOT:-/data/users/jchengak/DiffA/CellDiffA/data}/PerturbDiff_data/finetune_data/nadig_processed_data/replogle.h5ad
+    pert_col: gene
+    context_col: cell_line
+    batch_col: gem_group
+    control_pert: non-targeting
+    expression_key: X_hvg
+  norman:
+    family: combinatorial_genetic
+    source: Norman/GEARS
+    path: ${CELLDIFFA_DATA_ROOT:-/data/users/jchengak/DiffA/CellDiffA/data}/raw/norman.h5ad
+    pert_col: condition
+    context_col: cell_type
+    batch_col: null
+    control_pert: ctrl
+    expression_key: X

@@ -10,6 +10,7 @@ import pickle
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+import pandas as pd
 import scanpy as sc
 from anndata import AnnData
 
@@ -22,16 +23,15 @@ class PerturbationDataManager:
     Supported datasets:
         - norman: K562 CRISPRa combinatorial perturbations (Norman et al., 2019)
         - replogle_k562: K562 CRISPRi single perturbations (Replogle et al., 2022)
-        - adamson: CRISPRi perturbations (Adamson et al., 2016)
 
     Supported split strategies:
-        - additive: Random 70/30 train/test split of combinatorial perturbations
-        - combinations: Hold out 15 combos + their constituent single perturbations
-        - unseen: Remove 12 genes entirely (all related perturbations become test)
+        - additive: Disjoint folds of held-out combinatorial perturbations
+        - unseen: Disjoint folds of held-out genes and all related conditions
     """
 
-    SUPPORTED_DATASETS = ["norman", "replogle_k562", "adamson"]
-    SUPPORTED_SPLITS = ["additive", "combinations", "unseen"]
+    SUPPORTED_DATASETS = ["norman", "replogle_k562"]
+    SUPPORTED_SPLITS = ["additive", "unseen"]
+    SPLIT_VERSION = "v2"
 
     def __init__(
         self,
@@ -39,11 +39,13 @@ class PerturbationDataManager:
         dataset_name: str = "norman",
         n_top_genes: int = 2000,
         seed: int = 42,
+        already_normalized: bool = True,
     ):
         self.data_root = data_root
         self.dataset_name = dataset_name
         self.n_top_genes = n_top_genes
         self.seed = seed
+        self.already_normalized = already_normalized
 
         self.raw_dir = os.path.join(data_root, "raw")
         self.processed_dir = os.path.join(data_root, "processed")
@@ -61,6 +63,7 @@ class PerturbationDataManager:
         # Track split state for cache key construction
         self._split_strategy: Optional[str] = None
         self._fold: Optional[int] = None
+        self._n_folds: Optional[int] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -75,7 +78,8 @@ class PerturbationDataManager:
         4. Force perturbation target genes into HVG set
         """
         processed_path = os.path.join(
-            self.processed_dir, f"{self.dataset_name}_hvg{self.n_top_genes}.h5ad"
+            self.processed_dir,
+            f"{self.dataset_name}_{self._preprocessing_tag}_hvg{self.n_top_genes}.h5ad",
         )
 
         if os.path.exists(processed_path):
@@ -94,9 +98,16 @@ class PerturbationDataManager:
             self.adata.write_h5ad(processed_path)
             print(f"[DataManager] Preprocessed data saved to {processed_path}")
 
+        self._standardize_metadata()
         # Extract control cells
         self.ctrl_adata = self.adata[self.adata.obs["is_control"]].copy()
+        if self.ctrl_adata.n_obs == 0:
+            raise ValueError("Dataset contains no control cells.")
         return self.adata
+
+    @property
+    def _preprocessing_tag(self) -> str:
+        return "log_input" if self.already_normalized else "raw_counts"
 
     def create_split(
         self,
@@ -113,17 +124,20 @@ class PerturbationDataManager:
         if self.adata is None:
             self.load_and_preprocess()
 
-        assert split_strategy in self.SUPPORTED_SPLITS, (
-            f"Unsupported split: {split_strategy}. Choose from {self.SUPPORTED_SPLITS}"
-        )
+        if split_strategy not in self.SUPPORTED_SPLITS:
+            raise ValueError(
+                f"Unsupported split: {split_strategy}. Choose from {self.SUPPORTED_SPLITS}"
+            )
 
         # Store split state for cache key construction
         self._split_strategy = split_strategy
         self._fold = fold
+        self._n_folds = n_folds
 
         split_file = os.path.join(
             self.splits_dir,
-            f"{self.dataset_name}_{split_strategy}_fold{fold}_of{n_folds}_seed{self.seed}.pkl",
+            f"{self.dataset_name}_{split_strategy}_{self.SPLIT_VERSION}_"
+            f"fold{fold}_of{n_folds}_seed{self.seed}.pkl",
         )
 
         if os.path.exists(split_file):
@@ -164,7 +178,10 @@ class PerturbationDataManager:
                 "Must call create_split() before computing priors. "
                 "Cache keys depend on split state."
             )
-        return f"{self.dataset_name}_{self._split_strategy}_fold{self._fold}_seed{self.seed}"
+        return (
+            f"{self.dataset_name}_{self._split_strategy}_fold{self._fold}"
+            f"_of{self._n_folds}_seed{self.seed}_{self._preprocessing_tag}"
+        )
 
     def compute_de_genes(self, top_k: int = 20) -> Dict[str, List[str]]:
         """
@@ -176,6 +193,8 @@ class PerturbationDataManager:
         """
         if self.adata_train is None:
             raise RuntimeError("Must call create_split() before compute_de_genes()")
+        if top_k < 1:
+            raise ValueError("top_k must be positive.")
 
         cache_key = self._get_prior_cache_key()
         de_cache = os.path.join(
@@ -195,8 +214,7 @@ class PerturbationDataManager:
 
         gene_names = list(self.adata_train.var_names)
         conditions = [
-            c for c in self.adata_train.obs["condition"].unique()
-            if c != "ctrl" and c != "control"
+            c for c in self.adata_train.obs["condition"].unique() if c != "ctrl" and c != "control"
         ]
 
         self.de_genes = {}
@@ -244,8 +262,7 @@ class PerturbationDataManager:
         ctrl_mean = ctrl_expr.mean(axis=0).flatten()
 
         conditions = [
-            c for c in self.adata_train.obs["condition"].unique()
-            if c != "ctrl" and c != "control"
+            c for c in self.adata_train.obs["condition"].unique() if c != "ctrl" and c != "control"
         ]
 
         shifts = {}
@@ -254,7 +271,7 @@ class PerturbationDataManager:
             cond_expr = cond_cells.X
             if hasattr(cond_expr, "toarray"):
                 cond_expr = cond_expr.toarray()
-            shifts[cond] = (cond_expr.mean(axis=0).flatten() - ctrl_mean)
+            shifts[cond] = cond_expr.mean(axis=0).flatten() - ctrl_mean
 
         with open(shift_cache, "wb") as f:
             pickle.dump(shifts, f)
@@ -287,14 +304,16 @@ class PerturbationDataManager:
         """Standard preprocessing pipeline."""
         adata = self.adata
 
-        # Normalize and log-transform
-        sc.pp.normalize_total(adata, target_sum=1e4)
-        sc.pp.log1p(adata)
+        # GEARS-distributed H5AD files are already log-normalized. Repeating
+        # normalize_total/log1p changes the checkpoint input space.
+        if not self.already_normalized:
+            sc.pp.normalize_total(adata, target_sum=1e4)
+            sc.pp.log1p(adata)
 
         # Select HVGs
         sc.pp.highly_variable_genes(adata, n_top_genes=self.n_top_genes, inplace=True)
 
-        # Force perturbation target genes into HVG set
+        # Force perturbation target genes into the fixed-size HVG set.
         conditions = adata.obs["condition"].unique()
         pert_genes = set()
         for cond in conditions:
@@ -302,70 +321,94 @@ class PerturbationDataManager:
                 if g not in ("ctrl", "control"):
                     pert_genes.add(g)
 
-        for gene in pert_genes:
-            if gene in adata.var_names:
-                adata.var.loc[gene, "highly_variable"] = True
-
-        adata = adata[:, adata.var["highly_variable"]].copy()
-
-        # Standardize metadata columns
-        if "is_control" not in adata.obs.columns:
-            adata.obs["is_control"] = adata.obs["condition"].isin(["ctrl", "control"])
+        forced = {gene for gene in pert_genes if gene in adata.var_names}
+        if len(forced) > self.n_top_genes:
+            raise ValueError(
+                f"Found {len(forced)} perturbation genes but n_top_genes={self.n_top_genes}."
+            )
+        selected = set(adata.var_names[adata.var["highly_variable"]]) | forced
+        if len(selected) > self.n_top_genes:
+            score_column = (
+                "dispersions_norm" if "dispersions_norm" in adata.var.columns else "dispersions"
+            )
+            candidates = sorted(
+                selected - forced,
+                key=lambda gene: float(adata.var.loc[gene, score_column]),
+                reverse=True,
+            )
+            selected = forced | set(candidates[: self.n_top_genes - len(forced)])
+        mask = adata.var_names.isin(selected)
+        adata = adata[:, mask].copy()
+        if adata.n_vars != self.n_top_genes:
+            raise ValueError(
+                f"Expected exactly {self.n_top_genes} genes after selection, got {adata.n_vars}."
+            )
 
         self.adata = adata
+        self._standardize_metadata()
 
-    def _generate_split(
-        self, strategy: str, fold: int, n_folds: int
-    ) -> Dict[str, list]:
+    def _standardize_metadata(self) -> None:
+        if "condition" not in self.adata.obs.columns:
+            raise ValueError("AnnData.obs must contain a 'condition' column.")
+        if "is_control" not in self.adata.obs.columns:
+            self.adata.obs["is_control"] = self.adata.obs["condition"].isin(["ctrl", "control"])
+        values = self.adata.obs["is_control"]
+        if pd.api.types.is_bool_dtype(values.dtype):
+            normalized = values
+        elif pd.api.types.is_numeric_dtype(values.dtype):
+            normalized = values.astype(bool)
+        else:
+            normalized = values.astype(str).str.lower().isin({"true", "1", "yes"})
+        self.adata.obs["is_control"] = normalized
+
+    def _generate_split(self, strategy: str, fold: int, n_folds: int) -> Dict[str, list]:
         """Generate train/test split indices."""
         conditions = self.adata.obs["condition"].unique()
         combo_conditions = [
-            c for c in conditions
-            if c not in ("ctrl", "control") and "+" in c
-            and "ctrl" not in c and "control" not in c
+            c
+            for c in conditions
+            if c not in ("ctrl", "control") and "+" in c and "ctrl" not in c and "control" not in c
         ]
         combo_conditions = np.array(sorted(combo_conditions))
 
-        rng = np.random.default_rng(self.seed + fold)
+        if not 0 <= fold < n_folds:
+            raise ValueError(f"fold must be in [0, {n_folds}), got {fold}.")
+        rng = np.random.default_rng(self.seed)
 
         if strategy == "additive":
             shuffled = combo_conditions.copy()
             rng.shuffle(shuffled)
-            split_idx = int(len(shuffled) * 0.3)
-            test_conditions = shuffled[:split_idx].tolist()
-            return {"test": test_conditions, "strategy": strategy, "fold": fold}
-
-        elif strategy == "combinations":
-            shuffled = combo_conditions.copy()
-            rng.shuffle(shuffled)
-            test_combos = shuffled[:15].tolist()
-
-            # Also hold out constituent single perturbations
-            single_genes = set()
-            for combo in test_combos:
-                for g in combo.split("+"):
-                    single_genes.add(g)
-
-            single_conditions = [f"{g}+ctrl" for g in single_genes]
-            single_conditions += [f"{g}+control" for g in single_genes]
-            # Filter to only those that actually exist
-            existing = set(conditions)
-            single_conditions = [c for c in single_conditions if c in existing]
-
-            test_conditions = test_combos + single_conditions
-            return {"test": test_conditions, "strategy": strategy, "fold": fold}
+            if len(shuffled) < n_folds:
+                raise ValueError(
+                    f"Split 'additive' requires at least {n_folds} combination conditions; "
+                    f"found {len(shuffled)}."
+                )
+            test_conditions = np.array_split(shuffled, n_folds)[fold].tolist()
+            return {
+                "test": test_conditions,
+                "strategy": strategy,
+                "fold": fold,
+                "n_folds": n_folds,
+            }
 
         elif strategy == "unseen":
-            # Extract all unique single genes from combo perturbations
+            # Extract all perturbation genes, including single-only datasets.
             all_singles = set()
-            for combo in combo_conditions:
-                for g in combo.split("+"):
-                    all_singles.add(g)
+            for condition in conditions:
+                for gene in condition.split("+"):
+                    if gene not in {"ctrl", "control"}:
+                        all_singles.add(gene)
             all_singles = sorted(all_singles)
             rng.shuffle(all_singles)
 
-            # Remove 12 genes entirely
-            remove_genes = set(all_singles[:12])
+            # Partition genes into disjoint folds; all conditions involving a
+            # held-out gene become test conditions.
+            if len(all_singles) < n_folds:
+                raise ValueError(
+                    f"Split 'unseen' requires at least {n_folds} perturbation genes; "
+                    f"found {len(all_singles)}."
+                )
+            remove_genes = set(np.array_split(np.asarray(all_singles), n_folds)[fold].tolist())
 
             # All conditions involving removed genes become test
             test_conditions = []
@@ -381,6 +424,7 @@ class PerturbationDataManager:
                 "removed_genes": list(remove_genes),
                 "strategy": strategy,
                 "fold": fold,
+                "n_folds": n_folds,
             }
 
         raise ValueError(f"Unknown strategy: {strategy}")
