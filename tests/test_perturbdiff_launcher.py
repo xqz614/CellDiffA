@@ -68,10 +68,9 @@ def test_replogle_scratch_uses_2000_hvg_space(tmp_path):
 
 def test_replogle_finetuned_uses_12626_pretraining_gene_space(tmp_path):
     args = _run_launcher(tmp_path, "finetuned")
-    assert "data=tahoe100m_pbmc_replogle_pretrain_cellxgene" in args
+    assert "data=replogle_finetune" in args
     assert "model.input_dim=12626" in args
     assert "data.pad_length=12626" in args
     assert "data.embed_key=X" in args
-    assert "data.skip_cellxgene=true" in args
-    assert "data.skip_tahoe100m=true" in args
-    assert "data.skip_pbmc=true" in args
+    assert not any(arg.startswith("data.skip_tahoe100m=") for arg in args)
+    assert not any(arg.startswith("data.skip_pbmc=") for arg in args)
