@@ -20,6 +20,7 @@ perturbdiff_root="${5:-external/PerturbDiff}"
 data_root="${CELLDIFFA_DATA_ROOT:-/data/users/jchengak/DiffA/CellDiffA/data}"
 perturb_data_root="$data_root/PerturbDiff_data"
 checkpoint_root="$data_root/checkpoints/PerturbDiff_release_ckpt"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 case "$dataset" in
   pbmc)
@@ -64,8 +65,9 @@ case "$variant" in
     ;;
 esac
 
-entrypoint="$perturbdiff_root/src/apps/run/rawdata_diffusion_sampling.py"
-for required in "$entrypoint" "$checkpoint" "$perturb_data_root"; do
+upstream_entrypoint="$perturbdiff_root/src/apps/run/rawdata_diffusion_sampling.py"
+entrypoint="$script_dir/perturbdiff_sampling_entrypoint.py"
+for required in "$upstream_entrypoint" "$entrypoint" "$checkpoint" "$perturb_data_root"; do
   if [[ ! -e "$required" ]]; then
     echo "Missing required path: $required" >&2
     exit 1
@@ -74,6 +76,7 @@ done
 
 mkdir -p "$output_dir"
 export CUDA_VISIBLE_DEVICES="$gpu"
+export PERTURBDIFF_ROOT="$(cd "$perturbdiff_root" && pwd)"
 
 # OmegaConf resolves relative interpolation from a list item differently from
 # a mapping value. The upstream trixie_onehot config puts ${..path.tmp_dir}
