@@ -21,6 +21,11 @@ data_root="${CELLDIFFA_DATA_ROOT:-/data/users/jchengak/DiffA/CellDiffA/data}"
 perturb_data_root="$data_root/PerturbDiff_data"
 checkpoint_root="$data_root/checkpoints/PerturbDiff_release_ckpt"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+model_input_dim=2000
+pad_length=2000
+embed_key="X_hvg"
+variant_overrides=()
+required_asset=""
 
 case "$dataset" in
   pbmc)
@@ -65,6 +70,27 @@ case "$variant" in
     ;;
 esac
 
+# Replogle marginal-pretraining finetuning retains the 12,626-gene union used
+# in pretraining. Its released checkpoint therefore cannot consume the 2,000
+# HVG input used by the from-scratch checkpoint.
+if [[ "$dataset" == "replogle" && "$variant" == "finetuned" ]]; then
+  data_config="tahoe100m_pbmc_replogle_pretrain_cellxgene"
+  model_input_dim=12626
+  pad_length=12626
+  embed_key="X"
+  merged_genes="$perturb_data_root/selected_genes/merged_pbmc_tahoe_rep_cellxgene_genes_mapped.pkl"
+  required_asset="$merged_genes"
+  variant_overrides=(
+    "data.selected_gene_file=$merged_genes"
+    "data.skip_cellxgene=true"
+    "data.skip_tahoe100m=true"
+    "data.skip_pbmc=true"
+    "data.skip_replogle=false"
+    "data.skip_cached_indices=true"
+    "data.max_open_files=1000"
+  )
+fi
+
 upstream_entrypoint="$perturbdiff_root/src/apps/run/rawdata_diffusion_sampling.py"
 entrypoint="$script_dir/perturbdiff_sampling_entrypoint.py"
 for required in "$upstream_entrypoint" "$entrypoint" "$checkpoint" "$perturb_data_root"; do
@@ -73,6 +99,10 @@ for required in "$upstream_entrypoint" "$entrypoint" "$checkpoint" "$perturb_dat
     exit 1
   fi
 done
+if [[ -n "$required_asset" && ! -e "$required_asset" ]]; then
+  echo "Missing required path: $required_asset" >&2
+  exit 1
+fi
 
 mkdir -p "$output_dir"
 export CUDA_VISIBLE_DEVICES="$gpu"
@@ -99,10 +129,10 @@ common=(
   "data.use_cell_set=$cell_set"
   "data.keep_control_cell=false"
   "optimization.micro_batch_size=$micro_batch"
-  "model.hidden_num=[2000,512]"
-  "model.input_dim=2000"
-  "data.pad_length=2000"
-  "data.embed_key=X_hvg"
+  "model.hidden_num=[$model_input_dim,512]"
+  "model.input_dim=$model_input_dim"
+  "data.pad_length=$pad_length"
+  "data.embed_key=$embed_key"
   "trainer.devices=[0]"
   "trainer.use_distributed_sampler=false"
   "device=cuda:0"
@@ -129,4 +159,8 @@ common=(
   "~lightning.logger.name"
 )
 
-python "$entrypoint" "${common[@]}" "${extra_covariates[@]}"
+if [[ "$dataset" == "replogle" && "$variant" == "finetuned" ]]; then
+  python "$entrypoint" "${common[@]}" "${variant_overrides[@]}" "${extra_covariates[@]}"
+else
+  python "$entrypoint" "${common[@]}" "${extra_covariates[@]}"
+fi
