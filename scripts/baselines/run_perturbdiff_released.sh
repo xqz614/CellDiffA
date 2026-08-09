@@ -74,7 +74,6 @@ esac
 # in pretraining. Its released checkpoint therefore cannot consume the 2,000
 # HVG input used by the from-scratch checkpoint.
 if [[ "$dataset" == "replogle" && "$variant" == "finetuned" ]]; then
-  data_config="tahoe100m_pbmc_replogle_pretrain_cellxgene"
   model_input_dim=12626
   pad_length=12626
   embed_key="X"
@@ -82,10 +81,6 @@ if [[ "$dataset" == "replogle" && "$variant" == "finetuned" ]]; then
   required_asset="$merged_genes"
   variant_overrides=(
     "data.selected_gene_file=$merged_genes"
-    "data.skip_cellxgene=true"
-    "data.skip_tahoe100m=true"
-    "data.skip_pbmc=true"
-    "data.skip_replogle=false"
     "data.skip_cached_indices=true"
     "data.max_open_files=1000"
   )
