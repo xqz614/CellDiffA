@@ -178,10 +178,13 @@ penalty 0.1. It uses deterministic truncated SVD for the same rank-10 PCA
 objective as `prcomp_irlba`. No R or GPU is needed.
 
 Fitting uses the full `X`/`var_names` gene space from the released Replogle
-H5AD so every CRISPR target can receive a training-data PCA embedding. Only the
-ordered 2,000 genes in `X_hvg`/`replogle_real_selected_genes.pkl` are written to
-the prediction file for evaluation. The two spaces must not be conflated:
-many held-out perturbation targets are intentionally absent from the 2,000 HVGs.
+H5AD for gene-side PCA. Perturbation-side vectors use PerturbDiff's released
+`replogle_gene_emb_dict_perturbation_emb_dict.pkl` GenePT dictionary because
+some CRISPR targets are absent even from the full expression matrix. This is
+the external `pert_embedding` branch supported by the official Linear solver.
+Only the ordered 2,000 genes in `X_hvg`/`replogle_real_selected_genes.pkl` are
+written to the prediction file. Test GenePT coverage is strict; missing test
+embeddings are never silently replaced by zero vectors.
 
 `pooled` is the primary PerturbDiff-aligned result: every row in the official
 training mask is used and context is ignored, matching the context-agnostic

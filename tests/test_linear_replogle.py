@@ -132,6 +132,26 @@ def test_test_perturbation_can_be_outside_evaluation_hvgs():
     assert prediction["target"].shape == (2,)
 
 
+def test_external_perturbation_embedding_supports_non_expression_target():
+    fit = fit_official_linear(
+        np.asarray(
+            [[1, 2, 3, 4], [2, 4, 1, 3], [0, 1, 2, 3]],
+            dtype=np.float64,
+        ),
+        ["target", "other", "ctrl"],
+        ["g1", "g2", "g3", "g4"],
+        control_pert="ctrl",
+        pca_dim=1,
+        perturbation_embeddings={
+            "target": np.asarray([1.0, 0.0, 0.0]),
+            "other": np.asarray([0.0, 1.0, 0.0]),
+            "unseen": np.asarray([0.0, 0.0, 1.0]),
+        },
+    )
+    prediction = fit.predict_means(["unseen"], output_genes=["g2", "g4"])
+    assert prediction["unseen"].shape == (2,)
+
+
 def test_linear_rejects_non_gene_test_perturbation():
     fit = fit_official_linear(
         np.asarray([[1, 2, 3], [2, 3, 4], [0, 1, 2]], dtype=np.float64),
@@ -140,14 +160,14 @@ def test_linear_rejects_non_gene_test_perturbation():
         control_pert="ctrl",
         pca_dim=1,
     )
-    with pytest.raises(ValueError, match="missing=.*drug-X"):
+    with pytest.raises(ValueError, match="missing test values.*drug-X"):
         fit.predict_means(["drug-X"])
 
 
 def test_runner_fits_full_x_but_writes_only_evaluation_hvgs(tmp_path, monkeypatch):
     split_path = tmp_path / "split.yaml"
     _write_split(split_path)
-    full_genes = ["A", "B", "C", "g1", "g2", "g3"]
+    full_genes = ["A", "C", "D", "g1", "g2", "g3"]
     labels = ["non-targeting", "non-targeting", "A", "A", "B", "B", "C", "C"]
     contexts = ["k562", "hepg2", "k562", "hepg2", "k562", "hepg2", "hepg2", "hepg2"]
     values = np.arange(48, dtype=np.float32).reshape(8, 6)
@@ -166,6 +186,16 @@ def test_runner_fits_full_x_but_writes_only_evaluation_hvgs(tmp_path, monkeypatc
     selected_path = tmp_path / "selected.pkl"
     with selected_path.open("wb") as handle:
         pickle.dump(["g1", "g2"], handle)
+    embedding_path = tmp_path / "genept.pkl"
+    with embedding_path.open("wb") as handle:
+        pickle.dump(
+            {
+                "A": np.asarray([1.0, 0.0, 0.0]),
+                "B": np.asarray([0.0, 1.0, 0.0]),
+                "C": np.asarray([0.0, 0.0, 1.0]),
+            },
+            handle,
+        )
     real = ad.AnnData(
         X=np.asarray([[1, 2], [3, 4]], dtype=np.float32),
         obs=pd.DataFrame(
@@ -191,6 +221,8 @@ def test_runner_fits_full_x_but_writes_only_evaluation_hvgs(tmp_path, monkeypatc
             str(split_path),
             "--selected-genes",
             str(selected_path),
+            "--perturbation-embeddings",
+            str(embedding_path),
             "--output",
             str(output_path),
             "--pca-dim",
