@@ -13,10 +13,11 @@ fi
 data_root="${CELLDIFFA_DATA_ROOT:-$repo_root/data}"
 source_h5ad="$data_root/PerturbDiff_data/finetune_data/nadig_processed_data/replogle.h5ad"
 selected_genes="$data_root/PerturbDiff_data/selected_genes/replogle_real_selected_genes.pkl"
+perturbation_embeddings="$data_root/PerturbDiff_data/gene_names/replogle_gene_emb_dict_perturbation_emb_dict.pkl"
 real_test="$repo_root/results/replogle/reference/real.h5ad"
 split_config="$repo_root/external/PerturbDiff/configs/data/perturb_data/replogle.yaml"
 
-for path in "$source_h5ad" "$selected_genes" "$real_test" "$split_config"; do
+for path in "$source_h5ad" "$selected_genes" "$perturbation_embeddings" "$real_test" "$split_config"; do
   if [[ ! -e "$path" ]]; then
     echo "Missing required input: $path" >&2
     exit 1
@@ -37,6 +38,7 @@ python "$repo_root/scripts/baselines/run_linear_replogle.py" \
   --real-test "$real_test" \
   --upstream-split-config "$split_config" \
   --selected-genes "$selected_genes" \
+  --perturbation-embeddings "$perturbation_embeddings" \
   --output "$prediction_dir/$method_name.h5ad" \
   --model-output "$model_dir/$method_name.npz" \
   --mode "$mode"
