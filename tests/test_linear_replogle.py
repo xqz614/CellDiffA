@@ -1,3 +1,6 @@
+import pickle
+import sys
+
 import anndata as ad
 import numpy as np
 import pandas as pd
@@ -5,11 +8,13 @@ import pytest
 import yaml
 
 from celldiffa.benchmark.linear_replogle import (
+    LinearFit,
     fit_official_linear,
     pca_scores,
     training_pseudobulk,
 )
 from celldiffa.benchmark.perturbdiff_split import PerturbDiffSplit
+from scripts.baselines.run_linear_replogle import main as run_linear
 
 
 def _write_split(path):
@@ -108,7 +113,63 @@ def test_official_two_sided_ridge_equations():
     )
     np.testing.assert_allclose(fit.coefficients, expected, rtol=1e-10, atol=1e-10)
     np.testing.assert_allclose(fit.response_center, center)
-    assert set(fit.predict_means(["B", "E"])) == {"B", "E"}
+    predictions = fit.predict_means(["B", "E"], output_genes=["C", "F"])
+    assert set(predictions) == {"B", "E"}
+    assert predictions["B"].shape == (2,)
+
+
+def test_test_perturbation_can_be_outside_evaluation_hvgs():
+    fit = fit_official_linear(
+        np.asarray(
+            [[1, 2, 3, 4], [2, 4, 1, 3], [0, 1, 2, 3]],
+            dtype=np.float64,
+        ),
+        ["target", "other", "ctrl"],
+        ["target", "other", "hvg1", "hvg2"],
+        control_pert="ctrl",
+        pca_dim=1,
+    )
+    prediction = fit.predict_means(["target"], output_genes=["hvg1", "hvg2"])
+    assert prediction["target"].shape == (2,)
+
+
+def test_external_perturbation_embedding_supports_non_expression_target():
+    fit = fit_official_linear(
+        np.asarray(
+            [[1, 2, 3, 4], [2, 4, 1, 3], [0, 1, 2, 3]],
+            dtype=np.float64,
+        ),
+        ["target", "other", "ctrl"],
+        ["g1", "g2", "g3", "g4"],
+        control_pert="ctrl",
+        pca_dim=1,
+        perturbation_embeddings={
+            "target": np.asarray([1.0, 0.0, 0.0]),
+            "other": np.asarray([0.0, 1.0, 0.0]),
+            "unseen": np.asarray([0.0, 0.0, 1.0]),
+        },
+    )
+    prediction = fit.predict_means(["unseen"], output_genes=["g2", "g4"])
+    assert prediction["unseen"].shape == (2,)
+
+
+def test_predictions_are_projected_to_nonnegative_log_expression():
+    fit = LinearFit(
+        gene_scores=np.asarray([[1.0], [2.0]]),
+        coefficients=np.asarray([[-1.0]]),
+        response_center=np.zeros(2),
+        control_baseline=np.zeros(2),
+        genes=("g1", "g2"),
+        perturbation_names=("target",),
+        perturbation_scores=np.asarray([[1.0]]),
+        training_conditions=("ctrl",),
+        pca_dim=1,
+        ridge_penalty=0.1,
+    )
+
+    prediction = fit.predict_means(["target"])["target"]
+
+    np.testing.assert_array_equal(prediction, np.zeros(2))
 
 
 def test_linear_rejects_non_gene_test_perturbation():
@@ -119,5 +180,80 @@ def test_linear_rejects_non_gene_test_perturbation():
         control_pert="ctrl",
         pca_dim=1,
     )
-    with pytest.raises(ValueError, match="missing=.*drug-X"):
+    with pytest.raises(ValueError, match="missing test values.*drug-X"):
         fit.predict_means(["drug-X"])
+
+
+def test_runner_fits_full_x_but_writes_only_evaluation_hvgs(tmp_path, monkeypatch):
+    split_path = tmp_path / "split.yaml"
+    _write_split(split_path)
+    full_genes = ["A", "C", "D", "g1", "g2", "g3"]
+    labels = ["non-targeting", "non-targeting", "A", "A", "B", "B", "C", "C"]
+    contexts = ["k562", "hepg2", "k562", "hepg2", "k562", "hepg2", "hepg2", "hepg2"]
+    values = np.arange(48, dtype=np.float32).reshape(8, 6)
+    source = ad.AnnData(
+        X=values,
+        obs=pd.DataFrame(
+            {"gene": labels, "cell_line": contexts, "gem_group": ["b1"] * 8},
+            index=[f"source{i}" for i in range(8)],
+        ),
+        var=pd.DataFrame(index=full_genes),
+    )
+    source.obsm["X_hvg"] = values[:, [3, 4]]
+    source_path = tmp_path / "source.h5ad"
+    source.write_h5ad(source_path)
+
+    selected_path = tmp_path / "selected.pkl"
+    with selected_path.open("wb") as handle:
+        pickle.dump(["g1", "g2"], handle)
+    embedding_path = tmp_path / "genept.pkl"
+    with embedding_path.open("wb") as handle:
+        pickle.dump(
+            {
+                "A": np.asarray([1.0, 0.0, 0.0]),
+                "B": np.asarray([0.0, 1.0, 0.0]),
+                "C": np.asarray([0.0, 0.0, 1.0]),
+            },
+            handle,
+        )
+    real = ad.AnnData(
+        X=np.asarray([[1, 2], [3, 4]], dtype=np.float32),
+        obs=pd.DataFrame(
+            {"gene": ["non-targeting", "B"], "cell_line": ["hepg2", "hepg2"]},
+            index=["real0", "real1"],
+        ),
+        var=pd.DataFrame(index=["g1", "g2"]),
+    )
+    real_path = tmp_path / "real.h5ad"
+    real.write_h5ad(real_path)
+    output_path = tmp_path / "linear.h5ad"
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_linear_replogle.py",
+            "--source",
+            str(source_path),
+            "--real-test",
+            str(real_path),
+            "--upstream-split-config",
+            str(split_path),
+            "--selected-genes",
+            str(selected_path),
+            "--perturbation-embeddings",
+            str(embedding_path),
+            "--output",
+            str(output_path),
+            "--pca-dim",
+            "2",
+        ],
+    )
+    run_linear()
+
+    prediction = ad.read_h5ad(output_path)
+    assert list(prediction.var_names) == ["g1", "g2"]
+    assert prediction.shape == real.shape
+    manifest = prediction.uns["celldiffa_linear_replogle"]
+    assert manifest["fitting_genes"] == 6
+    assert manifest["evaluation_genes"] == 2

@@ -40,6 +40,38 @@ def patch_covariate_paths(checkpoint_cfg: Any, runtime_cfg: Any) -> Any:
     return patched
 
 
+def load_sampling_model_portable(cfg, logger, datamodule):
+    """Load a released checkpoint after replacing author-cluster paths."""
+    import torch
+    from src.models.lightning.lightning_module import PlModel
+
+    checkpoint = torch.load(
+        cfg.model_checkpoint_path,
+        map_location="cpu",
+        weights_only=False,
+    )
+    hparams = checkpoint.get("hyper_parameters", {})
+    covariate_cfg = patch_covariate_paths(
+        hparams.get("cov_encoding_cfg"),
+        cfg.cov_encoding,
+    )
+    model_cfg = hparams.get("model_cfg", cfg.model)
+    optimizer_cfg = hparams.get("optimizer_cfg", cfg.optimization)
+    del checkpoint
+
+    return PlModel.load_from_checkpoint(
+        cfg.model_checkpoint_path,
+        cov_encoding_cfg=covariate_cfg,
+        model_cfg=model_cfg,
+        optimizer_cfg=optimizer_cfg,
+        py_logger=logger,
+        trainer_cfg=cfg.trainer,
+        all_split_names=datamodule.all_split_names,
+        map_location="cuda:0" if torch.cuda.is_available() else "cpu",
+        weights_only=False,
+    )
+
+
 def main() -> None:
     upstream_root_value = os.environ.get("PERTURBDIFF_ROOT")
     if not upstream_root_value:
@@ -52,41 +84,12 @@ def main() -> None:
 
     sys.path.insert(0, str(upstream_root))
 
-    import torch
     from hydra import compose, initialize_config_dir
     from src.apps.run import rawdata_diffusion_sampling as upstream
-    from src.models.lightning.lightning_module import PlModel
-
-    def load_sampling_model(cfg, logger, datamodule):
-        checkpoint = torch.load(
-            cfg.model_checkpoint_path,
-            map_location="cpu",
-            weights_only=False,
-        )
-        hparams = checkpoint.get("hyper_parameters", {})
-        covariate_cfg = patch_covariate_paths(
-            hparams.get("cov_encoding_cfg"),
-            cfg.cov_encoding,
-        )
-        model_cfg = hparams.get("model_cfg", cfg.model)
-        optimizer_cfg = hparams.get("optimizer_cfg", cfg.optimization)
-        del checkpoint
-
-        return PlModel.load_from_checkpoint(
-            cfg.model_checkpoint_path,
-            cov_encoding_cfg=covariate_cfg,
-            model_cfg=model_cfg,
-            optimizer_cfg=optimizer_cfg,
-            py_logger=logger,
-            trainer_cfg=cfg.trainer,
-            all_split_names=datamodule.all_split_names,
-            map_location="cuda:0" if torch.cuda.is_available() else "cpu",
-            weights_only=False,
-        )
 
     # rawdata_diffusion_sampling imported the loader into its module namespace;
     # replacing that reference keeps the official model and sampling flow.
-    upstream.load_sampling_model = load_sampling_model
+    upstream.load_sampling_model = load_sampling_model_portable
 
     # Calling the decorated upstream main after importing it makes Hydra treat
     # ../../../configs as a Python package. PerturbDiff's configs directory is

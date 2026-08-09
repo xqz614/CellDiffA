@@ -9,7 +9,12 @@ from pathlib import Path
 import anndata as ad
 import numpy as np
 
-from celldiffa.benchmark.artifacts import load_selected_genes, sha256_file, write_manifest
+from celldiffa.benchmark.artifacts import (
+    load_embedding_dict,
+    load_selected_genes,
+    sha256_file,
+    write_manifest,
+)
 from celldiffa.benchmark.contracts import build_prediction_anndata
 from celldiffa.benchmark.linear_replogle import fit_official_linear, training_pseudobulk
 from celldiffa.benchmark.perturbdiff_split import PerturbDiffSplit
@@ -30,9 +35,20 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--real-test", required=True)
     parser.add_argument("--upstream-split-config", required=True)
     parser.add_argument("--selected-genes", required=True)
+    parser.add_argument(
+        "--perturbation-embeddings",
+        help="PerturbDiff Replogle GenePT name-to-vector pickle",
+    )
     parser.add_argument("--output", required=True)
     parser.add_argument("--model-output", help="Optional fitted .npz path")
-    parser.add_argument("--expression-key", default="X_hvg")
+    parser.add_argument(
+        "--expression-key",
+        default="X",
+        help=(
+            "Expression space used to learn gene-side PCA. Replogle uses full X; "
+            "predictions are restricted to the 2,000 evaluation HVGs."
+        ),
+    )
     parser.add_argument("--mode", choices=["pooled", "heldout_only"], default="pooled")
     parser.add_argument("--pca-dim", type=int, default=10)
     parser.add_argument("--ridge-penalty", type=float, default=0.1)
@@ -47,13 +63,21 @@ def main() -> None:
     real_path = Path(args.real_test).resolve()
     split_path = Path(args.upstream_split_config).resolve()
     genes_path = Path(args.selected_genes).resolve()
+    embedding_path = (
+        Path(args.perturbation_embeddings).resolve()
+        if args.perturbation_embeddings
+        else None
+    )
     output_path = Path(args.output).resolve()
     model_path = (
         Path(args.model_output).resolve()
         if args.model_output
         else output_path.with_suffix(".model.npz")
     )
-    for path in (source, real_path, split_path, genes_path):
+    required_paths = [source, real_path, split_path, genes_path]
+    if embedding_path is not None:
+        required_paths.append(embedding_path)
+    for path in required_paths:
         if not path.exists():
             raise FileNotFoundError(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -66,10 +90,44 @@ def main() -> None:
             f"found {split.holdout_contexts}."
         )
     selected_genes = load_selected_genes(genes_path)
+    perturbation_embeddings = (
+        load_embedding_dict(embedding_path) if embedding_path is not None else None
+    )
     real = ad.read_h5ad(real_path)
     split.validate_real_test(real)
     if list(real.var_names.astype(str)) != selected_genes:
         raise ValueError("Selected-gene pickle order differs from the real-test H5AD.")
+
+    source_backed = ad.read_h5ad(source, backed="r")
+    try:
+        if args.expression_key == "X":
+            fit_genes = list(source_backed.var_names.astype(str))
+        elif args.expression_key == "X_hvg":
+            fit_genes = selected_genes
+        else:
+            raise ValueError(
+                "Linear currently supports expression-key X (full fitting space) or "
+                "X_hvg (evaluation space)."
+            )
+    finally:
+        source_backed.file.close()
+    labels = real.obs[split.pert_col].astype(str).to_numpy()
+    test_perts = sorted(set(labels) - {split.control_pert})
+    embedding_names = (
+        set(perturbation_embeddings) if perturbation_embeddings is not None else set(fit_genes)
+    )
+    missing_test_perts = sorted(set(test_perts) - embedding_names)
+    if missing_test_perts:
+        raise ValueError(
+            "Replogle perturbation embeddings are missing test genes; "
+            f"missing={missing_test_perts[:20]}."
+        )
+    missing_evaluation_genes = sorted(set(selected_genes) - set(fit_genes))
+    if missing_evaluation_genes:
+        raise ValueError(
+            "Replogle full X/var_names is missing evaluation genes; "
+            f"missing={missing_evaluation_genes[:20]}."
+        )
 
     pseudobulk, conditions, counts = training_pseudobulk(
         source,
@@ -78,23 +136,22 @@ def main() -> None:
         mode=args.mode,
         chunk_size=args.chunk_size,
     )
-    if pseudobulk.shape[1] != len(selected_genes):
+    if pseudobulk.shape[1] != len(fit_genes):
         raise ValueError(
             f"Source {args.expression_key} has {pseudobulk.shape[1]} genes, but "
-            f"the selected-gene file has {len(selected_genes)}."
+            f"the inferred fitting gene space has {len(fit_genes)}."
         )
     fit = fit_official_linear(
         pseudobulk,
         conditions,
-        selected_genes,
+        fit_genes,
         control_pert=split.control_pert,
         pca_dim=args.pca_dim,
         ridge_penalty=args.ridge_penalty,
+        perturbation_embeddings=perturbation_embeddings,
     )
 
-    labels = real.obs[split.pert_col].astype(str).to_numpy()
-    test_perts = sorted(set(labels) - {split.control_pert})
-    predicted_means = fit.predict_means(test_perts)
+    predicted_means = fit.predict_means(test_perts, output_genes=selected_genes)
     predictions = {
         pert: np.repeat(
             mean[None, :],
@@ -122,9 +179,10 @@ def main() -> None:
         ),
         "split_policy": "PerturbDiff official masks; validation/test expression excluded",
         "prediction_population": "official deterministic pseudobulk mean repeated per test cell",
+        "output_projection": "maximum(raw_log1p_prediction, 0.0) for Cell-Eval validity",
         "implementation": (
             "Python translation of official PCA and two-sided ridge equations; "
-            "deterministic full SVD replaces prcomp_irlba"
+            "deterministic truncated SVD replaces prcomp_irlba"
         ),
         "official_repository": OFFICIAL_REPOSITORY,
         "official_revision": OFFICIAL_REVISION,
@@ -136,11 +194,20 @@ def main() -> None:
         "output": str(output_path),
         "model_output": str(model_path),
         "expression_key": args.expression_key,
+        "perturbation_embedding_source": (
+            str(embedding_path) if embedding_path is not None else "training_data_pca"
+        ),
+        "perturbation_embedding_dimension": fit.perturbation_scores.shape[0],
+        "fitting_genes": len(fit_genes),
+        "evaluation_genes": len(selected_genes),
         "pca_dim": args.pca_dim,
         "ridge_penalty": args.ridge_penalty,
         "holdout_contexts": list(split.holdout_contexts),
         "test_perturbations": len(test_perts),
         "matched_training_conditions": len(fit.training_conditions) - 1,
+        "unmatched_training_conditions": sorted(
+            (set(conditions) - {split.control_pert}) - embedding_names
+        ),
         "counts": counts,
         "input_hashes_skipped": args.skip_input_hashes,
     }
@@ -151,6 +218,8 @@ def main() -> None:
             "split_config": sha256_file(split_path),
             "selected_genes": sha256_file(genes_path),
         }
+        if embedding_path is not None:
+            manifest["sha256"]["perturbation_embeddings"] = sha256_file(embedding_path)
     pred.uns["celldiffa_linear_replogle"] = manifest
     pred.write_h5ad(output_path, compression="gzip")
     np.savez_compressed(
@@ -160,6 +229,8 @@ def main() -> None:
         response_center=fit.response_center,
         control_baseline=fit.control_baseline,
         genes=np.asarray(fit.genes),
+        perturbation_names=np.asarray(fit.perturbation_names),
+        perturbation_scores=fit.perturbation_scores,
         training_conditions=np.asarray(fit.training_conditions),
         pca_dim=np.asarray(fit.pca_dim),
         ridge_penalty=np.asarray(fit.ridge_penalty),

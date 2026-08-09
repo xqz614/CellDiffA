@@ -1,20 +1,22 @@
 """Official Linear baseline equations adapted to PerturbDiff Replogle data.
 
 The reference R implementation is ``run_linear_pretrained_model.R`` from
-``const-ae/linear_perturbation_prediction-Paper``.  It pseudobulks training
-conditions, obtains both gene and perturbation embeddings from the same PCA,
-and solves a two-sided ridge regression.  This module keeps those operations
-while reading PerturbDiff's large H5AD in chunks.
+``const-ae/linear_perturbation_prediction-Paper``. It pseudobulks training
+conditions and solves a two-sided ridge regression using PCA gene embeddings
+and either PCA or external perturbation embeddings. This module keeps those
+operations while reading PerturbDiff's large H5AD in chunks.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
 import anndata as ad
 import numpy as np
 import pandas as pd
+from scipy.sparse.linalg import svds
 
 from .perturbdiff_split import PerturbDiffSplit
 from .streaming import iter_h5ad_expression
@@ -27,27 +29,47 @@ class LinearFit:
     response_center: np.ndarray
     control_baseline: np.ndarray
     genes: tuple[str, ...]
+    perturbation_names: tuple[str, ...]
+    perturbation_scores: np.ndarray
     training_conditions: tuple[str, ...]
     pca_dim: int
     ridge_penalty: float
 
-    def predict_means(self, perturbations: list[str]) -> dict[str, np.ndarray]:
+    def predict_means(
+        self,
+        perturbations: list[str],
+        *,
+        output_genes: list[str] | None = None,
+    ) -> dict[str, np.ndarray]:
         gene_to_position = {gene: position for position, gene in enumerate(self.genes)}
-        missing = sorted(set(perturbations) - set(gene_to_position))
+        pert_to_position = {
+            pert: position for position, pert in enumerate(self.perturbation_names)
+        }
+        missing = sorted(set(perturbations) - set(pert_to_position))
         if missing:
             raise ValueError(
-                "Linear training-data embeddings require every test perturbation to be an "
-                f"expression gene; missing={missing[:20]}."
+                f"Linear perturbation embeddings are missing test values: {missing[:20]}."
             )
-        pert_scores = np.stack(
-            [self.gene_scores[gene_to_position[pert]] for pert in perturbations],
-            axis=1,
-        )
+        pert_scores = self.perturbation_scores[
+            :, [pert_to_position[pert] for pert in perturbations]
+        ]
         values = (
             self.gene_scores @ self.coefficients @ pert_scores
             + self.response_center[:, None]
             + self.control_baseline[:, None]
         )
+        if output_genes is not None:
+            missing_outputs = sorted(set(output_genes) - set(gene_to_position))
+            if missing_outputs:
+                raise ValueError(
+                    "Linear output genes are absent from the fitting expression space; "
+                    f"missing={missing_outputs[:20]}."
+                )
+            values = values[[gene_to_position[gene] for gene in output_genes]]
+        # Cell-Eval's log-normalized expression contract requires non-negative
+        # values. Ridge regression is unconstrained and can extrapolate below
+        # zero, so project only the final expression output onto its valid domain.
+        values = np.maximum(values, 0.0)
         return {pert: values[:, index].copy() for index, pert in enumerate(perturbations)}
 
 
@@ -132,8 +154,9 @@ def training_pseudobulk(
 def pca_scores(matrix: np.ndarray, *, n_components: int) -> np.ndarray:
     """Equivalent principal-component scores to R ``prcomp_irlba``.
 
-    Full deterministic SVD is used because the PerturbDiff space is only 2,000
-    genes.  PCA signs are arbitrary and cancel in the two-sided ridge model.
+    Deterministic truncated SVD solves the same leading-component objective as
+    ``irlba`` without materializing a full decomposition of the 12,626-gene
+    Replogle matrix. PCA signs are arbitrary and cancel in the ridge model.
     """
     matrix = np.asarray(matrix, dtype=np.float64)
     if matrix.ndim != 2:
@@ -145,8 +168,15 @@ def pca_scores(matrix: np.ndarray, *, n_components: int) -> np.ndarray:
             f"choose 1..{max_components}."
         )
     centered = matrix - matrix.mean(axis=0, keepdims=True)
-    left, singular_values, _ = np.linalg.svd(centered, full_matrices=False)
-    return left[:, :n_components] * singular_values[:n_components]
+    left, singular_values, _ = svds(
+        centered,
+        k=n_components,
+        which="LM",
+        v0=np.ones(min(centered.shape), dtype=np.float64),
+        solver="arpack",
+    )
+    order = np.argsort(singular_values)[::-1]
+    return left[:, order] * singular_values[order]
 
 
 def fit_official_linear(
@@ -157,6 +187,7 @@ def fit_official_linear(
     control_pert: str,
     pca_dim: int = 10,
     ridge_penalty: float = 0.1,
+    perturbation_embeddings: Mapping[str, np.ndarray] | None = None,
 ) -> LinearFit:
     """Fit the equations in the pinned official Linear R implementation."""
     pseudobulk = np.asarray(pseudobulk, dtype=np.float64)
@@ -176,13 +207,31 @@ def fit_official_linear(
     expression = pseudobulk.T
     scores = pca_scores(expression, n_components=pca_dim)
     gene_to_position = {gene: position for position, gene in enumerate(genes)}
+    if perturbation_embeddings is None:
+        embedding_map = {
+            gene: scores[position] for gene, position in gene_to_position.items()
+        }
+    else:
+        embedding_map = {
+            str(name): np.asarray(vector, dtype=np.float64).reshape(-1)
+            for name, vector in perturbation_embeddings.items()
+        }
+        if not embedding_map:
+            raise ValueError("External perturbation embeddings are empty.")
+        dimensions = {len(vector) for vector in embedding_map.values()}
+        if len(dimensions) != 1 or 0 in dimensions:
+            raise ValueError(
+                "External perturbation embeddings must share one non-zero dimension."
+            )
+        if not all(np.all(np.isfinite(vector)) for vector in embedding_map.values()):
+            raise ValueError("External perturbation embeddings contain non-finite values.")
     usable_conditions = [
         condition
         for condition in conditions
-        if condition == control_pert or condition in gene_to_position
+        if condition == control_pert or condition in embedding_map
     ]
     if len(usable_conditions) <= 1:
-        raise ValueError("Too few matches between training conditions and expression genes.")
+        raise ValueError("Too few matches between training conditions and perturbation embeddings.")
     condition_to_position = {
         condition: position for position, condition in enumerate(conditions)
     }
@@ -192,35 +241,52 @@ def fit_official_linear(
     response_center = response.mean(axis=1)
     centered_response = response - response_center[:, None]
 
-    perturbation_scores = np.stack(
+    perturbation_dim = len(next(iter(embedding_map.values())))
+    training_perturbation_scores = np.stack(
         [
-            np.zeros(pca_dim, dtype=np.float64)
+            np.zeros(perturbation_dim, dtype=np.float64)
             if condition == control_pert
-            else scores[gene_to_position[condition]]
+            else embedding_map[condition]
             for condition in usable_conditions
         ],
         axis=1,
     )
-    identity = np.eye(pca_dim, dtype=np.float64)
+    gene_identity = np.eye(pca_dim, dtype=np.float64)
     left = np.linalg.solve(
-        scores.T @ scores + ridge_penalty * identity,
+        scores.T @ scores + ridge_penalty * gene_identity,
         scores.T @ centered_response,
     )
-    coefficients = (
-        left
-        @ perturbation_scores.T
-        @ np.linalg.solve(
-            perturbation_scores @ perturbation_scores.T + ridge_penalty * identity,
-            identity,
+    if perturbation_dim <= len(usable_conditions):
+        perturbation_identity = np.eye(perturbation_dim, dtype=np.float64)
+        right = training_perturbation_scores.T @ np.linalg.solve(
+            training_perturbation_scores @ training_perturbation_scores.T
+            + ridge_penalty * perturbation_identity,
+            perturbation_identity,
         )
-    )
+    else:
+        # B.T @ inv(B @ B.T + lambda I) equals
+        # inv(B.T @ B + lambda I) @ B.T. The dual form is substantially
+        # cheaper for high-dimensional GenePT vectors because conditions << dims.
+        condition_identity = np.eye(len(usable_conditions), dtype=np.float64)
+        right = np.linalg.solve(
+            training_perturbation_scores.T @ training_perturbation_scores
+            + ridge_penalty * condition_identity,
+            training_perturbation_scores.T,
+        )
+    coefficients = left @ right
     coefficients[~np.isfinite(coefficients)] = 0.0
+    perturbation_names = tuple(sorted(embedding_map))
+    all_perturbation_scores = np.stack(
+        [embedding_map[name] for name in perturbation_names], axis=1
+    )
     return LinearFit(
         gene_scores=scores,
         coefficients=coefficients,
         response_center=response_center,
         control_baseline=control_baseline,
         genes=tuple(genes),
+        perturbation_names=perturbation_names,
+        perturbation_scores=all_perturbation_scores,
         training_conditions=tuple(usable_conditions),
         pca_dim=pca_dim,
         ridge_penalty=ridge_penalty,

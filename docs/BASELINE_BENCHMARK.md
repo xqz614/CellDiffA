@@ -169,14 +169,96 @@ Copy one of the resulting `diffusion_true_*.h5ad` files to
 `results/replogle/reference/real.h5ad`, then verify that both runs produced the
 same ordered real test matrix before evaluating them together.
 
+## CellDiffA on the released Replogle task
+
+CellDiffA reuses the released PerturbDiff DataModule, checkpoint, covariate
+encoder, 32-cell set layout, and official DDIM single step. SMC particles are
+complete 32-cell populations; the implementation never flattens them into
+independent cells. Rewards are evaluated in the ordered 2,000-gene benchmark
+space, while the finetuned checkpoint still samples in its native 12,626-gene
+space. Padded cells are retained for Cross-DiT attention but excluded from all
+rewards and saved predictions.
+
+The prior cache uses only rows in PerturbDiff's official training mask. For
+each test perturbation it subtracts the control mean of the corresponding cell
+line before pooling shifts. Held-out perturbed expression is never read by the
+reward or copied into a prediction; the held-out HepG2 controls remain the
+model condition, as in the released task.
+
+Eight released test targets have no perturbation cells anywhere in the official
+training mask. Their priors are predicted with a centered dual ridge map from
+released GenePT perturbation embeddings to the context-corrected shifts of
+observed training perturbations. The manifest labels every target as either
+`direct_training_mean` or `genept_dual_ridge`; the fallback never fits on
+held-out expression.
+
+First run one cell set as a smoke test (no evaluator-ready H5AD is written for
+a partial run):
+
+```bash
+conda activate celldiffa-perturbdiff
+export CELLDIFFA_DATA_ROOT=/data/users/jchengak/DiffA/CellDiffA/data
+
+bash scripts/baselines/run_celldiffa_replogle.sh \
+  scratch results/replogle/celldiffa_scratch_smoke 2 0 1 1
+```
+
+For the primary finetuned result, one GPU can run the complete resumable job:
+
+```bash
+bash scripts/baselines/run_celldiffa_replogle.sh \
+  finetuned results/replogle/celldiffa_finetuned 2
+```
+
+Every official cell set is saved atomically under `shards/`. Repeating the same
+command skips valid completed shards. To use all eight GPUs, open eight tmux
+windows and run one command per worker, changing both the physical GPU and
+worker index from 0 through 7:
+
+```bash
+bash scripts/baselines/run_celldiffa_replogle.sh \
+  finetuned results/replogle/celldiffa_finetuned 0 0 8 all
+```
+
+After every worker completes, assemble the shared shards. Assembly fails rather
+than writing a partial file if any perturbation has the wrong cell count:
+
+```bash
+python scripts/baselines/assemble_celldiffa_replogle.py \
+  --real-test results/replogle/reference/real.h5ad \
+  --shard-root results/replogle/celldiffa_finetuned/shards \
+  --output results/replogle/celldiffa_finetuned/celldiffa_finetuned.h5ad
+
+python scripts/baselines/evaluate.py \
+  --real results/replogle/reference/real.h5ad \
+  --pred results/replogle/celldiffa_finetuned/celldiffa_finetuned.h5ad \
+  --outdir results/replogle/metrics/celldiffa_finetuned \
+  --pert-col gene \
+  --control-pert non-targeting \
+  --num-threads 32
+```
+
 ## Linear on Replogle
 
 The Replogle runner translates the equations in the pinned official
-`run_linear_pretrained_model.R`: condition pseudobulk, a shared 10-dimensional
-PCA for gene and perturbation embeddings, and two-sided ridge regression with
-penalty 0.1. It uses deterministic full SVD instead of `prcomp_irlba`; this is
-the same rank-10 PCA objective without randomized approximation. No R or GPU is
-needed.
+`run_linear_pretrained_model.R`: condition pseudobulk, a 10-dimensional PCA for
+gene embeddings, external perturbation embeddings, and two-sided ridge
+regression with penalty 0.1. It uses deterministic truncated SVD for the same
+rank-10 PCA objective as `prcomp_irlba`. No R or GPU is needed.
+
+Fitting uses the full `X`/`var_names` gene space from the released Replogle
+H5AD for gene-side PCA. Perturbation-side vectors use PerturbDiff's released
+`replogle_gene_emb_dict_perturbation_emb_dict.pkl` GenePT dictionary because
+some CRISPR targets are absent even from the full expression matrix. This is
+the external `pert_embedding` branch supported by the official Linear solver.
+Only the ordered 2,000 genes in `X_hvg`/`replogle_real_selected_genes.pkl` are
+written to the prediction file. Test GenePT coverage is strict; missing test
+embeddings are never silently replaced by zero vectors.
+
+The official ridge equations are unconstrained and can extrapolate below zero.
+Because Cell-Eval requires valid non-negative log1p expression, the runner
+projects only the final expression predictions with `maximum(value, 0)` before
+writing the H5AD. The fitted coefficients and saved model remain unchanged.
 
 `pooled` is the primary PerturbDiff-aligned result: every row in the official
 training mask is used and context is ignored, matching the context-agnostic
