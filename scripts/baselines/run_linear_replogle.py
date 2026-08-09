@@ -91,6 +91,21 @@ def main() -> None:
             )
     finally:
         source_backed.file.close()
+    labels = real.obs[split.pert_col].astype(str).to_numpy()
+    test_perts = sorted(set(labels) - {split.control_pert})
+    missing_test_perts = sorted(set(test_perts) - set(fit_genes))
+    if missing_test_perts:
+        raise ValueError(
+            "Replogle full X/var_names is missing test perturbation genes; "
+            f"missing={missing_test_perts[:20]}. A separate perturbation embedding "
+            "is required for this data artifact."
+        )
+    missing_evaluation_genes = sorted(set(selected_genes) - set(fit_genes))
+    if missing_evaluation_genes:
+        raise ValueError(
+            "Replogle full X/var_names is missing evaluation genes; "
+            f"missing={missing_evaluation_genes[:20]}."
+        )
 
     pseudobulk, conditions, counts = training_pseudobulk(
         source,
@@ -113,8 +128,6 @@ def main() -> None:
         ridge_penalty=args.ridge_penalty,
     )
 
-    labels = real.obs[split.pert_col].astype(str).to_numpy()
-    test_perts = sorted(set(labels) - {split.control_pert})
     predicted_means = fit.predict_means(test_perts, output_genes=selected_genes)
     predictions = {
         pert: np.repeat(
