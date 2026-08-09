@@ -66,6 +66,10 @@ class LinearFit:
                     f"missing={missing_outputs[:20]}."
                 )
             values = values[[gene_to_position[gene] for gene in output_genes]]
+        # Cell-Eval's log-normalized expression contract requires non-negative
+        # values. Ridge regression is unconstrained and can extrapolate below
+        # zero, so project only the final expression output onto its valid domain.
+        values = np.maximum(values, 0.0)
         return {pert: values[:, index].copy() for index, pert in enumerate(perturbations)}
 
 

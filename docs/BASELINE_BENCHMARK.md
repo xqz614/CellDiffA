@@ -186,6 +186,11 @@ Only the ordered 2,000 genes in `X_hvg`/`replogle_real_selected_genes.pkl` are
 written to the prediction file. Test GenePT coverage is strict; missing test
 embeddings are never silently replaced by zero vectors.
 
+The official ridge equations are unconstrained and can extrapolate below zero.
+Because Cell-Eval requires valid non-negative log1p expression, the runner
+projects only the final expression predictions with `maximum(value, 0)` before
+writing the H5AD. The fitted coefficients and saved model remain unchanged.
+
 `pooled` is the primary PerturbDiff-aligned result: every row in the official
 training mask is used and context is ignored, matching the context-agnostic
 official Linear model. `heldout_only` is an optional sensitivity analysis that
