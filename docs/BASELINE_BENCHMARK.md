@@ -185,6 +185,13 @@ line before pooling shifts. Held-out perturbed expression is never read by the
 reward or copied into a prediction; the held-out HepG2 controls remain the
 model condition, as in the released task.
 
+Eight released test targets have no perturbation cells anywhere in the official
+training mask. Their priors are predicted with a centered dual ridge map from
+released GenePT perturbation embeddings to the context-corrected shifts of
+observed training perturbations. The manifest labels every target as either
+`direct_training_mean` or `genept_dual_ridge`; the fallback never fits on
+held-out expression.
+
 First run one cell set as a smoke test (no evaluator-ready H5AD is written for
 a partial run):
 
