@@ -75,6 +75,13 @@ done
 mkdir -p "$output_dir"
 export CUDA_VISIBLE_DEVICES="$gpu"
 
+# OmegaConf resolves relative interpolation from a list item differently from
+# a mapping value. The upstream trixie_onehot config puts ${..path.tmp_dir}
+# inside gene_embedding_path, which fails before sampling starts. Supply all
+# covariate asset paths explicitly so the launcher is independent of that
+# upstream interpolation bug.
+gene_embedding_paths="[$perturb_data_root/gene_names/pbmc_highly_variavle_gene_emb_dict_emb_dict.pkl,$perturb_data_root/gene_names/replogle_gene_emb_dict_perturbation_emb_dict.pkl,$perturb_data_root/gene_names/replogle_highly_variavle_gene_emb_dict_emb_dict.pkl,$perturb_data_root/gene_names/tahoe100m_highly_variavle_gene_emb_dict_emb_dict.pkl]"
+
 common=(
   "model_checkpoint_path=$checkpoint"
   # Select the upstream config groups explicitly before overriding their
@@ -106,6 +113,11 @@ common=(
   "sampling.eta=0.0"
   "sampling.guidance_strength=1.0"
   "cov_encoding.batch_encoding=onehot"
+  "cov_encoding.gene_embedding_path=$gene_embedding_paths"
+  "cov_encoding.pert_embedding_path=$perturb_data_root/meta_data/idx_to_pertemb.pkl"
+  "cov_encoding.celltype_embedding_path=$perturb_data_root/meta_data/new_all_emb.pkl"
+  "cov_encoding.drug_embedding_path=$perturb_data_root/meta_data/drug_embed_chemberta_cls_dict.pkl"
+  "cov_encoding.replogle_gene_embedding_path=$perturb_data_root/gene_names/replogle_gene_emb_dict_perturbation_emb_dict.pkl"
   "model.p_drop_control=0"
   "$sample_flag"
   "lightning.logger._target_=pytorch_lightning.loggers.logger.DummyLogger"
