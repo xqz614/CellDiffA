@@ -11,6 +11,8 @@ baselines:
     tier: paper
     kind: official_external
     runner: requires_dataset_adapter
+    runner_by_dataset:
+      replogle: end_to_end
     repository: https://github.com/const-ae/linear_perturbation_prediction-Paper
     revision: bfa6eeea2bd145a1af2ec0127a2e808cc38456a9
     datasets: [pbmc, tahoe100m, replogle, norman]
@@ -61,10 +63,15 @@ baselines:
     tier: extended
     kind: official_external
     runner: requires_dataset_adapter
+    runner_by_dataset:
+      replogle: end_to_end
+      norman: requires_dataset_adapter
     repository: https://github.com/snap-stanford/GEARS
     revision: f374e43e197b295016d80395d7a54ddb81cc6769
-    # Upstream explicitly does not support multi-cell-type training.
-    datasets: [norman]
+    # Upstream ships loaders for Norman and Replogle 2022 K562 essential.
+    # The Replogle runner must reuse the PerturbDiff split instead of asking
+    # GEARS to create its own simulation split.
+    datasets: [norman, replogle]
   cellot:
     tier: extended
     kind: official_external

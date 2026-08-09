@@ -38,9 +38,10 @@ def main() -> None:
     print(f"dataset={args.dataset} path={data_path} status={data_status}")
     if args.baseline:
         baseline = baselines[args.baseline]
+        runner = baseline.get("runner_by_dataset", {}).get(args.dataset, baseline["runner"])
         print(
             f"baseline={args.baseline} tier={baseline['tier']} "
-            f"status=applicable runner={baseline['runner']}"
+            f"status=applicable runner={runner}"
         )
 
 

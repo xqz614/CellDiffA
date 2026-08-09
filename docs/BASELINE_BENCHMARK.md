@@ -20,8 +20,11 @@ The PDF adds GEARS, CellOT, scDFM, scLAMBDA, Scouter, and VCWorld. These are
 registered as `extended` methods only where the upstream implementation can
 actually express the task. In particular:
 
-- GEARS is Norman-only here because upstream says it does not support training
-  across multiple cell types;
+- GEARS supports Norman and the Replogle 2022 K562 essential dataset through
+  official upstream loaders. For Replogle, the benchmark adapter must preserve
+  the PerturbDiff gene space and holdout split; GEARS' independently generated
+  `simulation` split is not a comparable result. GEARS still does not support
+  training across multiple cell types;
 - scDFM's released data/configuration covers Norman and ComboSciPlex, not the
   three PerturbDiff datasets;
 - scVI is a representation/generative model, not a conditioned perturbation
@@ -52,6 +55,17 @@ conda activate celldiffa-perturbdiff
 python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 ```
 
+GEARS also has a separate environment. Install the pinned official checkout
+without allowing it to replace the environment's CUDA-enabled PyTorch:
+
+```bash
+conda env create -f environments/gears.yaml
+conda activate celldiffa-gears
+python -m pip install -e . --no-deps
+python -m pip install -e external/GEARS --no-deps
+python -c "import torch, gears; print(torch.__version__, torch.cuda.is_available())"
+```
+
 Do not try to install every baseline into one environment. CPA, STATE,
 CellFlow, Squidiff, and PerturbDiff have incompatible dependency histories.
 
@@ -66,10 +80,12 @@ The registry's `runner` field is intentionally strict:
   native input schema has not yet been converted to the PerturbDiff split;
 - `not_applicable`: not a perturbation-response predictor for this protocol.
 
-At this revision, Mean and both released PerturbDiff variants are end-to-end.
-Linear, CPA, STATE, CellFlow, and Squidiff are **not yet end-to-end**: the
-PerturbDiff authors state that they used the official implementations, but do
-not publish the model-specific conversion/config files in their repository.
+At this revision, Mean, Linear on Replogle, and both released PerturbDiff
+variants are end-to-end. The extended GEARS runner is also end-to-end for the
+PerturbDiff-aligned Replogle protocol described below; Norman remains
+adapter-only. CPA, STATE, CellFlow, and Squidiff are **not yet end-to-end**:
+the PerturbDiff authors state that they used the official implementations, but
+do not publish the model-specific conversion/config files in their repository.
 Running an upstream demo or letting the model generate a new random split is
 not accepted as reproduction of the paper baseline.
 
@@ -109,13 +125,13 @@ Check a model/dataset combination before submitting a job:
 
 ```bash
 python scripts/baselines/doctor.py --dataset replogle --baseline state
+python scripts/baselines/doctor.py --dataset replogle --baseline gears
 python scripts/baselines/doctor.py --dataset norman --baseline gears
 ```
 
 ## Official sources
 
-No upstream model is reimplemented with an approximate API. Clone the pinned
-official revisions recorded by this repository:
+Clone the pinned official revisions recorded by this repository:
 
 ```bash
 bash scripts/baselines/clone_official_sources.sh external
@@ -152,6 +168,98 @@ bash scripts/baselines/run_perturbdiff_released.sh \
 Copy one of the resulting `diffusion_true_*.h5ad` files to
 `results/replogle/reference/real.h5ad`, then verify that both runs produced the
 same ordered real test matrix before evaluating them together.
+
+## Linear on Replogle
+
+The Replogle runner translates the equations in the pinned official
+`run_linear_pretrained_model.R`: condition pseudobulk, a shared 10-dimensional
+PCA for gene and perturbation embeddings, and two-sided ridge regression with
+penalty 0.1. It uses deterministic full SVD instead of `prcomp_irlba`; this is
+the same rank-10 PCA objective without randomized approximation. No R or GPU is
+needed.
+
+`pooled` is the primary PerturbDiff-aligned result: every row in the official
+training mask is used and context is ignored, matching the context-agnostic
+official Linear model. `heldout_only` is an optional sensitivity analysis that
+fits only the held-out HepG2 training subset. Both modes remove validation and
+test rows before any pseudobulk or PCA calculation.
+
+Run the primary baseline in the benchmark Conda environment:
+
+```bash
+conda activate celldiffa-benchmark
+export CELLDIFFA_DATA_ROOT=/data/users/jchengak/DiffA/CellDiffA/data
+
+bash scripts/baselines/run_linear_replogle.sh pooled
+```
+
+This writes the evaluator-ready prediction to
+`results/replogle/predictions/linear.h5ad`, the fitted matrices to
+`results/replogle/models/linear.npz`, and a fairness manifest beside the H5AD.
+The model predicts one pseudobulk expression vector per perturbation and repeats
+it to the exact real-test cell count, as required for deterministic Linear;
+real control rows are copied unchanged.
+
+Evaluate it with the exact PerturbDiff metric suite:
+
+```bash
+python scripts/baselines/evaluate.py \
+  --real results/replogle/reference/real.h5ad \
+  --pred results/replogle/predictions/linear.h5ad \
+  --outdir results/replogle/metrics/linear \
+  --pert-col gene \
+  --control-pert non-targeting \
+  --num-threads 32
+```
+
+The optional sensitivity run is:
+
+```bash
+bash scripts/baselines/run_linear_replogle.sh heldout_only
+```
+
+## GEARS on Replogle
+
+GEARS officially provides Replogle K562/RPE1 loaders, but the PerturbDiff task
+uses the four-context Replogle-Nadig data and holds out HepG2. GEARS is not
+context-aware, so it is an extended baseline rather than one of PerturbDiff's
+paper baselines. The runner implements two explicitly labelled protocols:
+
+- `pooled` (primary extended result): use every row in PerturbDiff's official
+  training mask, merge the contexts for GEARS, and predict one context-agnostic
+  response per perturbation;
+- `heldout_only` (ablation): use only HepG2 rows in the official training mask.
+
+In both modes, validation and test rows are removed before GEARS preprocessing,
+GEARS' random `simulation` split is disabled, predictions use the immutable
+`real.h5ad`, and the real control rows are copied into the prediction file.
+The runner fails if a test perturbation is absent from the GEARS GO graph.
+
+After `results/replogle/reference/real.h5ad` exists, run the primary result on
+physical GPU 2:
+
+```bash
+conda activate celldiffa-gears
+export CELLDIFFA_DATA_ROOT=/data/users/jchengak/DiffA/CellDiffA/data
+
+bash scripts/baselines/run_gears_replogle.sh \
+  pooled \
+  results/replogle/gears_pooled \
+  2
+```
+
+Optionally run the HepG2-only ablation on another free GPU:
+
+```bash
+bash scripts/baselines/run_gears_replogle.sh \
+  heldout_only \
+  results/replogle/gears_heldout_only \
+  3
+```
+
+Each output has a sibling `*.manifest.json` recording the split policy, row
+counts, hyperparameters, paths, and SHA-256 checksums. Do not report a run if
+the manifest says `input_hashes_skipped: true`.
 
 ## Prediction contract
 
@@ -258,8 +366,8 @@ partial table if any required metric cannot be computed.
 
 ## Recommended execution order
 
-1. Replogle: Mean variants, PerturbDiff released checkpoint, STATE, then the
-   remaining formal baselines.
+1. Replogle: Mean variants, PerturbDiff released checkpoint, STATE, GEARS with
+   the PerturbDiff-aligned split, then the remaining formal baselines.
 2. Norman: Mean, Linear, CPA, GEARS, scDFM, scLAMBDA, Scouter, and methods whose
    official input adapter has been validated on Norman.
 3. PBMC only after checking the roughly 750 GB storage requirement.

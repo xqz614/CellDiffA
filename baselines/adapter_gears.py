@@ -9,6 +9,7 @@ Note: GEARS produces a single point estimate per condition (not a distribution).
 """
 
 import os
+import pickle
 from typing import TYPE_CHECKING, Dict, List, Optional
 
 import numpy as np
@@ -35,10 +36,12 @@ class GEARSAdapter(BaseAdapter):
         data_path: str = "./data/gears_cache",
         device: str = "cuda",
         seed: int = 42,
+        default_pert_graph: bool = True,
     ):
         super().__init__(model_name="GEARS", device=device)
         self.data_path = data_path
         self.seed = seed
+        self.default_pert_graph = default_pert_graph
         self._model = None
         self._pert_data = None
 
@@ -50,6 +53,8 @@ class GEARSAdapter(BaseAdapter):
         batch_size: int = 32,
         lr: float = 1e-3,
         hidden_size: int = 64,
+        split_strategy: str = "simulation",
+        dataset_name: str = "custom",
         **kwargs,
     ) -> None:
         """
@@ -73,12 +78,48 @@ class GEARSAdapter(BaseAdapter):
         os.makedirs(self.data_path, exist_ok=True)
 
         # Setup PertData from AnnData
-        self._pert_data = PertData(self.data_path)
+        self._pert_data = PertData(
+            self.data_path,
+            default_pert_graph=self.default_pert_graph,
+        )
         self._pert_data.new_data_process(
-            dataset_name="custom",
+            dataset_name=dataset_name,
             adata=adata_train,
         )
-        self._pert_data.prepare_split(split="simulation", seed=self.seed)
+        if split_strategy == "simulation":
+            self._pert_data.prepare_split(split="simulation", seed=self.seed)
+        elif split_strategy == "all_train":
+            # PerturbDiff already defines the benchmark split. The caller gives
+            # this adapter a training-only AnnData, so GEARS must not create a
+            # second random split. GEARS' official custom split API is used to
+            # register every available condition as training data. Validation
+            # reuses those rows solely for fixed-epoch checkpoint selection;
+            # no validation or test expression enters this AnnData.
+            conditions = list(self._pert_data.adata.obs["condition"].astype(str).unique())
+            split_path = os.path.join(
+                self._pert_data.dataset_path,
+                "celldiffa_all_train_split.pkl",
+            )
+            with open(split_path, "wb") as handle:
+                pickle.dump(
+                    {"train": conditions, "val": conditions, "test": []},
+                    handle,
+                )
+            self._pert_data.prepare_split(
+                split="custom",
+                seed=self.seed,
+                split_dict_path=split_path,
+            )
+            # The official trainer supports a no-test path, whereas a custom
+            # split with an empty test loader fails during post-training metrics.
+            self._pert_data.split = "no_test"
+            self._pert_data.train_gene_set_size = 1.0
+            self._pert_data.set2conditions = {
+                "train": conditions,
+                "val": conditions,
+            }
+        else:
+            raise ValueError("split_strategy must be 'simulation' or 'all_train'.")
         self._pert_data.get_dataloader(batch_size=batch_size, test_batch_size=batch_size)
 
         # Initialize and train model

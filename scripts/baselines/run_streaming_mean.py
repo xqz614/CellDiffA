@@ -8,9 +8,9 @@ from pathlib import Path
 
 import anndata as ad
 import numpy as np
-import yaml
 
 from celldiffa.benchmark.contracts import build_prediction_anndata
+from celldiffa.benchmark.perturbdiff_split import PerturbDiffSplit
 from celldiffa.benchmark.streaming import iter_h5ad_expression
 
 
@@ -46,16 +46,14 @@ def main() -> None:
     parser.add_argument("--chunk-size", type=int, default=8192)
     args = parser.parse_args()
 
-    with Path(args.upstream_split_config).open(encoding="utf-8") as handle:
-        split = yaml.safe_load(handle)
-    pert_col = split["pert_col"]
-    control = str(split["control_pert"])
-    context_col = split.get("cell_line_key") or split.get("cell_type_key")
-    batch_col = split.get("perturbseq_batch_col")
-    axis_col = batch_col if args.split_axis == "batch" else context_col
-    holdouts = split["holdout_batches"] if args.split_axis == "batch" else split["holdout_celltype"]
-    validation_perts = {str(value) for value in split["holdout_pert"]["validation"]}
-    test_perts = {str(value) for value in split["holdout_pert"]["test"]}
+    split = PerturbDiffSplit.from_yaml(
+        args.upstream_split_config,
+        split_axis=args.split_axis,
+    )
+    pert_col = split.pert_col
+    control = split.control_pert
+    context_col = split.context_col
+    batch_col = split.batch_col
 
     stores = {
         "perturbation": defaultdict(lambda: (0.0, 0)),
@@ -67,17 +65,14 @@ def main() -> None:
     for path in _source_files(Path(args.source)):
         backed = ad.read_h5ad(path, backed="r")
         obs = backed.obs
-        required = {pert_col, axis_col, context_col, batch_col} - {None}
+        required = {pert_col, context_col, batch_col} - {None}
         missing = required - set(obs.columns)
         if missing:
             raise ValueError(f"{path} is missing obs columns: {sorted(missing)}")
         labels = obs[pert_col].astype(str).to_numpy()
-        axis = obs[axis_col].astype(str).to_numpy()
         contexts_all = obs[context_col].astype(str).to_numpy()
         batches_all = obs[batch_col].astype(str).to_numpy()
-        validation = np.isin(labels, list(validation_perts)) & np.isin(axis, holdouts)
-        testing = np.isin(labels, list(test_perts)) & np.isin(axis, holdouts)
-        training = ~(validation | testing)
+        training = split.masks(obs, split_axis=args.split_axis)["train"]
         treated_training = training & (labels != control)
 
         for start, stop, values in iter_h5ad_expression(
