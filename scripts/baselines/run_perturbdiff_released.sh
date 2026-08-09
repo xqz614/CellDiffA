@@ -77,6 +77,11 @@ export CUDA_VISIBLE_DEVICES="$gpu"
 
 common=(
   "model_checkpoint_path=$checkpoint"
+  # Select the upstream config groups explicitly before overriding their
+  # fields. PerturbDiff's official sampling command does the same; without
+  # these selections OmegaConf can fail while resolving ${path.tmp_dir}.
+  "path=trixie_path"
+  "cov_encoding=trixie_onehot"
   "data=$data_config"
   "data.normalize_counts=10"
   "data.num_workers=4"
