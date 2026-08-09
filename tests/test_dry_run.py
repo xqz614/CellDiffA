@@ -1,496 +1,181 @@
-"""
-Dry-run integration test for CellDiffA pipeline.
+"""Fast, model-free tests for CellDiffA's mathematical and shape contracts."""
 
-Tests the entire SMC engine + adapter interface without real model weights
-or real data. Uses mock objects to verify:
-1. DiffusionSamplerProtocol compliance
-2. SMCEngine execution (forward pass, resampling, weight update)
-3. Reward function computation
-4. Adapter factory and interface
-5. Configuration loading
-
-Run with: python tests/test_dry_run.py
-"""
-
-import os
-import sys
-import traceback
+from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
+import yaml
 
-# Add project root to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from celldiffa.evaluation.metrics import energy_distance, mmd_rbf, pearson_delta
+from celldiffa.rewards import AnchorReward, CompositeReward, TranscriptomicReward
+from celldiffa.smc import Resampler, ResamplingStrategy, SMCConfig, SMCEngine
 
 
-# ============================================================
-# Mock Sampler (satisfies DiffusionSamplerProtocol)
-# ============================================================
+class IdentitySampler:
+    """Deterministic sampler whose cell values identify their particle."""
 
-class MockDiffusionSampler:
-    """Mock sampler for testing the SMC engine without a real model."""
-
-    def __init__(self, num_genes: int = 50, num_timesteps: int = 20):
-        self._num_timesteps = num_timesteps
-        self._num_genes = num_genes
+    def __init__(self, timesteps: int = 4):
+        self._timesteps = timesteps
 
     @property
-    def num_timesteps(self) -> int:
-        return self._num_timesteps
+    def num_timesteps(self):
+        return self._timesteps
 
     def sample_noise(self, shape, device):
-        return torch.randn(shape, device=device)
+        values = torch.arange(np.prod(shape), device=device, dtype=torch.float32)
+        return values.reshape(shape) / 10.0
 
     def denoise_step(self, x_t, t, condition, prev_pred=None):
-        """Mock denoising: slightly move toward zero + small noise."""
-        N, G = x_t.shape
-        # Simulate gradual denoising
-        t_val = t[0].item()
-        alpha = 1.0 - (t_val / self._num_timesteps)
-        noise = 0.1 * torch.randn_like(x_t)
-        x_prev = alpha * x_t + (1 - alpha) * noise
-        x0_pred = x_t * 0.5 + torch.randn_like(x_t) * 0.1
-        return {"x_prev": x_prev, "x0_pred": x0_pred}
+        return {"x_prev": x_t, "x0_pred": x_t}
 
 
-# ============================================================
-# Test Functions
-# ============================================================
-
-def test_config_loading():
-    """Test that default.yaml loads correctly."""
-    import yaml
-    config_path = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "configs", "default.yaml"
-    )
-    with open(config_path, "r") as f:
-        config = yaml.safe_load(f)
-
-    assert config["smc"]["guidance_strength"] == 1.0, (
-        f"guidance_strength should be 1.0, got {config['smc']['guidance_strength']}"
-    )
-    assert config["smc"]["alpha"] == 1.0
-    assert config["smc"]["num_particles"] == 100
-    assert config["smc"]["tempering_schedule"] == "linear"
-    assert len(config["rewards"]["rewards"]) == 3
-    print("  [PASS] Config loading and guidance_strength fix verified")
+class MeanReward:
+    def compute(self, x_pred, condition, timestep, **kwargs):
+        return x_pred.mean(dim=(1, 2)) + float(timestep)
 
 
-def test_resampler():
-    """Test resampling algorithms."""
-    from celldiffa.smc import Resampler, ResamplingStrategy
-
-    for strategy in ResamplingStrategy:
-        resampler = Resampler(strategy=strategy)
-        weights = torch.softmax(torch.randn(50), dim=0)
-        indices = resampler.resample(weights, 50)
-        assert indices.shape == (50,), f"Expected shape (50,), got {indices.shape}"
-        assert indices.max() < 50
-        assert indices.min() >= 0
-
-    print("  [PASS] All resampling strategies work correctly")
-
-
-def test_smc_engine_basic():
-    """Test SMC engine with mock sampler."""
-    from celldiffa.smc import SMCEngine, SMCConfig
-
-    config = SMCConfig(
-        num_particles=30,
-        resampling_strategy="systematic",
-        ess_threshold=0.5,
-        tempering_schedule="linear",
-        alpha=1.0,
-        start_timestep=19,
-        guidance_strength=1.0,
-        output_mode="all",
+def make_config(**overrides):
+    values = dict(
+        num_particles=4,
+        cells_per_particle=3,
+        ess_threshold=0.01,
+        start_timestep=3,
+        output_mode="map",
         device="cpu",
-        batch_size_per_step=30,
+        batch_size_per_step=4,
+        seed=7,
     )
+    values.update(overrides)
+    return SMCConfig(**values)
 
-    # Mock reward function
-    class MockReward:
-        def compute(self, x_pred, condition, timestep, **kwargs):
-            # Simple reward: prefer cells with higher mean expression
-            return x_pred.mean(dim=1)
 
-    sampler = MockDiffusionSampler(num_genes=50, num_timesteps=20)
-    reward = MockReward()
-    engine = SMCEngine(sampler, reward, config)
+def test_default_config_is_population_level():
+    config_path = Path(__file__).parents[1] / "configs" / "default.yaml"
+    config = yaml.safe_load(config_path.read_text())
+    assert config["smc"]["cells_per_particle"] >= 2
+    assert config["smc"]["output_mode"] == "map"
+    assert config["rewards"]["normalization"] == "zscore"
 
+
+@pytest.mark.parametrize("strategy", list(ResamplingStrategy))
+def test_resamplers_return_valid_indices(strategy):
+    weights = torch.tensor([0.05, 0.15, 0.3, 0.5])
+    indices = Resampler(strategy).resample(weights, 20)
+    assert indices.shape == (20,)
+    assert int(indices.min()) >= 0
+    assert int(indices.max()) < len(weights)
+
+
+def test_smc_particle_is_a_cell_batch_and_map_returns_one_distribution():
+    engine = SMCEngine(IdentitySampler(), MeanReward(), make_config())
     result = engine.sample_with_alignment(
-        condition="GeneA+GeneB",
-        condition_emb={"mock": torch.zeros(1)},
-        ctrl_cells=torch.randn(20, 50),
-        num_genes=50,
-    )
-
-    assert "samples" in result
-    assert "weights" in result
-    assert "ess_history" in result
-    assert "resample_history" in result
-    assert result["samples"].shape == (30, 50), f"Got shape {result['samples'].shape}"
-    assert len(result["ess_history"]) == 20  # num_timesteps steps
-    print("  [PASS] SMC engine basic execution verified")
-
-
-def test_smc_engine_tempering_schedules():
-    """Test all tempering schedules."""
-    from celldiffa.smc import SMCEngine, SMCConfig
-
-    class MockReward:
-        def compute(self, x_pred, condition, timestep, **kwargs):
-            return torch.zeros(x_pred.shape[0])
-
-    for schedule in ["linear", "cosine", "adaptive"]:
-        config = SMCConfig(
-            num_particles=10,
-            tempering_schedule=schedule,
-            start_timestep=9,
-            device="cpu",
-            batch_size_per_step=10,
-        )
-        sampler = MockDiffusionSampler(num_genes=20, num_timesteps=10)
-        engine = SMCEngine(sampler, MockReward(), config)
-        result = engine.sample_with_alignment(
-            condition="test",
-            condition_emb={},
-            num_genes=20,
-        )
-        assert result["samples"].shape == (10, 20)
-
-    print("  [PASS] All tempering schedules work correctly")
-
-
-def test_reward_functions():
-    """Test reward function computation."""
-    from celldiffa.rewards import TranscriptomicReward, GeometricReward, AnchorReward, CompositeReward
-
-    G = 50
-    gene_names = [f"Gene{i}" for i in range(G)]
-    ctrl_mean = np.random.randn(G).astype(np.float32)
-
-    # DE genes for known conditions
-    de_genes = {
-        "GeneA+ctrl": gene_names[:10],
-        "GeneB+ctrl": gene_names[5:15],
-    }
-
-    # Perturbation shifts
-    shifts = {
-        "GeneA+ctrl": np.random.randn(G).astype(np.float32) * 0.5,
-        "GeneB+ctrl": np.random.randn(G).astype(np.float32) * 0.5,
-    }
-
-    # Test TranscriptomicReward
-    r_deg = TranscriptomicReward(
-        de_genes=de_genes,
-        perturbation_shifts=shifts,
-        ctrl_mean=ctrl_mean,
-        gene_names=gene_names,
-        weight=1.0,
-        top_k=10,
-    )
-
-    x_pred = torch.randn(20, G)
-    reward = r_deg.compute(x_pred, "GeneA+ctrl", timestep=50)
-    assert reward.shape == (20,), f"Expected (20,), got {reward.shape}"
-    assert torch.all(reward <= 0), "TranscriptomicReward should be negative (neg MSE)"
-
-    # Test for unseen combination
-    reward_combo = r_deg.compute(x_pred, "GeneA+GeneB", timestep=50)
-    assert reward_combo.shape == (20,)
-
-    # Test GeometricReward
-    r_geo = GeometricReward(
-        perturbation_shifts=shifts,
-        ctrl_mean=ctrl_mean,
-        weight=1.0,
-    )
-    reward_geo = r_geo.compute(x_pred, "GeneA+ctrl", timestep=50)
-    assert reward_geo.shape == (20,)
-
-    # Test AnchorReward
-    r_anchor = AnchorReward(
-        ctrl_mean=ctrl_mean,
-        weight=1.0,
-    )
-    reward_anchor = r_anchor.compute(x_pred, "GeneA+ctrl", timestep=50)
-    assert reward_anchor.shape == (20,)
-
-    # Test CompositeReward
-    composite = CompositeReward(
-        rewards=[r_deg, r_geo, r_anchor],
-        aggregation="linear",
-    )
-    reward_total = composite.compute(x_pred, "GeneA+ctrl", timestep=50)
-    assert reward_total.shape == (20,)
-
-    # Test Pareto aggregation
-    composite_pareto = CompositeReward(
-        rewards=[r_deg, r_geo, r_anchor],
-        aggregation="pareto",
-    )
-    reward_pareto = composite_pareto.compute(x_pred, "GeneA+ctrl", timestep=50)
-    assert reward_pareto.shape == (20,)
-
-    print("  [PASS] All reward functions compute correctly")
-
-
-def test_build_reward_from_config():
-    """Test the reward factory function."""
-    from celldiffa.smc.utils import build_reward_from_config
-
-    G = 50
-    gene_names = [f"Gene{i}" for i in range(G)]
-    ctrl_mean = np.random.randn(G).astype(np.float32)
-    de_genes = {"cond1": gene_names[:10]}
-    shifts = {"cond1": np.random.randn(G).astype(np.float32)}
-
-    config = {
-        "aggregation": "linear",
-        "rewards": [
-            {"type": "transcriptomic", "weight": 1.0, "top_k": 10},
-            {"type": "geometric", "weight": 1.0},
-            {"type": "anchor", "weight": 1.0},
-        ],
-    }
-
-    composite = build_reward_from_config(
-        config=config,
-        de_genes=de_genes,
-        shifts=shifts,
-        ctrl_mean=ctrl_mean,
-        gene_names=gene_names,
-    )
-
-    x_pred = torch.randn(10, G)
-    reward = composite.compute(x_pred, "cond1", timestep=50)
-    assert reward.shape == (10,)
-    print("  [PASS] build_reward_from_config works correctly")
-
-
-def test_adapter_imports():
-    """Test that all adapters can be imported."""
-    from baselines import (
-        BaseAdapter,
-        GEARSAdapter,
-        CPAAdapter,
-        PerturbDiffAdapter,
-        ScDFMAdapter,
-        SquidiffAdapter,
-        CellFlowAdapter,
-    )
-
-    # Verify they all inherit from BaseAdapter
-    for cls in [GEARSAdapter, CPAAdapter, PerturbDiffAdapter, ScDFMAdapter, SquidiffAdapter, CellFlowAdapter]:
-        assert issubclass(cls, BaseAdapter), f"{cls.__name__} doesn't inherit from BaseAdapter"
-
-    # Verify generative property
-    pd = PerturbDiffAdapter(device="cpu")
-    assert pd.is_generative is True
-
-    sq = SquidiffAdapter(device="cpu")
-    assert sq.is_generative is True
-
-    cf = CellFlowAdapter(device="cpu")
-    assert cf.is_generative is True
-
-    gears = GEARSAdapter(device="cpu")
-    assert gears.is_generative is False
-
-    print("  [PASS] All adapters import and instantiate correctly")
-
-
-def test_adapter_factory():
-    """Test the get_adapter factory from evaluate_model.py."""
-    sys.path.insert(0, os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"
-    ))
-    # Import the factory function directly
-    from scripts.evaluate_model import get_adapter
-
-    for name in ["gears", "cpa", "perturbdiff", "scdfm", "squidiff", "cellflow"]:
-        adapter = get_adapter(name, device="cpu")
-        assert adapter.model_name is not None
-        assert adapter.device == "cpu"
-
-    print("  [PASS] Adapter factory works for all model names")
-
-
-def test_smc_with_batched_denoise():
-    """Test SMC engine with batch_size_per_step < num_particles."""
-    from celldiffa.smc import SMCEngine, SMCConfig
-
-    class MockReward:
-        def compute(self, x_pred, condition, timestep, **kwargs):
-            return x_pred.mean(dim=1)
-
-    config = SMCConfig(
-        num_particles=50,
-        start_timestep=9,
-        device="cpu",
-        batch_size_per_step=15,  # Force batching
-    )
-
-    sampler = MockDiffusionSampler(num_genes=30, num_timesteps=10)
-    engine = SMCEngine(sampler, MockReward(), config)
-
-    result = engine.sample_with_alignment(
-        condition="test",
+        condition="A+B",
         condition_emb={},
-        num_genes=30,
+        ctrl_cells=torch.zeros(3, 2),
+        num_genes=2,
     )
-    assert result["samples"].shape == (50, 30)
-    print("  [PASS] Batched denoising works correctly")
+    assert result["all_particles"].shape == (4, 3, 2)
+    assert result["samples"].shape == (3, 2)
+    assert result["cells_per_particle"] == 3
+    assert result["resample_history"][-1] is False
 
 
-def test_evaluation_metrics():
-    """Test evaluation metrics computation."""
-    from celldiffa.evaluation import evaluate_all_conditions
-
-    G = 50
-    ctrl_mean = np.random.randn(G).astype(np.float32)
-
-    predictions = {
-        "cond1": np.random.randn(20, G).astype(np.float32),
-        "cond2": np.random.randn(20, G).astype(np.float32),
-    }
-    ground_truth = {
-        "cond1": np.random.randn(30, G).astype(np.float32),
-        "cond2": np.random.randn(30, G).astype(np.float32),
-    }
-
-    aggregated, per_condition = evaluate_all_conditions(
-        predictions=predictions,
-        ground_truth=ground_truth,
-        ctrl_mean=ctrl_mean,
-    )
-
-    assert "mse_all" in aggregated
-    assert "pearson_delta" in aggregated
-    assert "cond1" in per_condition
-    assert "cond2" in per_condition
-    print("  [PASS] Evaluation metrics compute correctly")
+def test_feynman_kac_potential_telescopes_to_terminal_reward():
+    sampler = IdentitySampler(timesteps=4)
+    engine = SMCEngine(sampler, MeanReward(), make_config())
+    result = engine.sample_with_alignment(condition="A", condition_emb={}, num_genes=2)
+    final_reward = result["all_particles"].mean(dim=(1, 2))
+    expected = torch.softmax(final_reward, dim=0)
+    assert torch.allclose(result["weights"], expected, atol=1e-6)
 
 
-def test_squidiff_sampler_interface():
-    """Test SquidiffSampler satisfies DiffusionSamplerProtocol."""
-    from baselines.adapter_squidiff import SquidiffSampler
-
-    # Create a mock model and diffusion for SquidiffSampler
-    class MockSquidiffModel:
-        def eval(self):
-            pass
-
-        def __call__(self, x, t, **kwargs):
-            return torch.randn_like(x)  # Mock epsilon prediction
-
-    class MockDiffusion:
+def test_condition_rows_follow_cells_across_forward_minibatches():
+    class RecordingSampler(IdentitySampler):
         def __init__(self):
-            self.num_timesteps = 100
-            self.alphas_cumprod = np.linspace(0.9999, 0.001, 100)
-            self.alphas_cumprod_prev = np.concatenate([[1.0], self.alphas_cumprod[:-1]])
-            self.timestep_map = list(range(0, 1000, 10))  # 100 steps
-            self.original_num_steps = 1000
-            self.rescale_timesteps = False
+            super().__init__(timesteps=1)
+            self.seen = []
 
-    model = MockSquidiffModel()
-    diffusion = MockDiffusion()
-    z_mod = torch.randn(1, 60)
+        def denoise_step(self, x_t, t, condition, prev_pred=None):
+            self.seen.extend(condition["cell_id"].cpu().tolist())
+            return super().denoise_step(x_t, t, condition, prev_pred)
 
-    sampler = SquidiffSampler(
-        model=model,
-        diffusion=diffusion,
-        z_mod=z_mod,
-        device="cpu",
-        eta=0.0,
-        clip_denoised=True,
+    sampler = RecordingSampler()
+    config = make_config(
+        num_particles=2,
+        cells_per_particle=3,
+        start_timestep=0,
+        batch_size_per_step=2,
     )
-
-    # Test interface
-    assert sampler.num_timesteps == 100
-
-    noise = sampler.sample_noise((20, 50), torch.device("cpu"))
-    assert noise.shape == (20, 50)
-
-    x_t = torch.randn(20, 50)
-    t = torch.full((20,), 50, dtype=torch.long)
-    output = sampler.denoise_step(x_t, t, condition={})
-    assert "x_prev" in output
-    assert "x0_pred" in output
-    assert output["x_prev"].shape == (20, 50)
-    assert output["x0_pred"].shape == (20, 50)
-
-    print("  [PASS] SquidiffSampler satisfies DiffusionSamplerProtocol")
+    engine = SMCEngine(sampler, MeanReward(), config)
+    engine.sample_with_alignment(
+        condition="A",
+        condition_emb={"cell_id": torch.tensor([0, 1, 2])},
+        num_genes=2,
+    )
+    assert sampler.seen == [0, 1, 2, 0, 1, 2]
 
 
-def test_cellflow_sampler_interface():
-    """Test CellFlowSampler basic interface (without JAX model)."""
-    # We can't fully test without a trained CellFlow model,
-    # but we can verify the adapter instantiation and interface
-    from baselines.adapter_cellflow import CellFlowAdapter
-
-    adapter = CellFlowAdapter(device="cpu", num_integration_steps=50)
-    assert adapter.model_name == "CellFlow"
-    assert adapter.is_generative is True
-    assert adapter.num_integration_steps == 50
-
-    print("  [PASS] CellFlowAdapter instantiation and interface verified")
+def reward_fixture():
+    genes = ["g0", "g1", "g2"]
+    ctrl = np.zeros(3, dtype=np.float32)
+    shifts = {"A+ctrl": np.array([1.0, 0.0, 0.0], dtype=np.float32)}
+    de_genes = {"A+ctrl": ["g0"]}
+    return genes, ctrl, shifts, de_genes
 
 
-# ============================================================
-# Main
-# ============================================================
-
-def main():
-    print("=" * 60)
-    print("  CellDiffA Dry-Run Integration Tests")
-    print("=" * 60)
-
-    tests = [
-        ("Config Loading", test_config_loading),
-        ("Resampler", test_resampler),
-        ("SMC Engine Basic", test_smc_engine_basic),
-        ("SMC Tempering Schedules", test_smc_engine_tempering_schedules),
-        ("Reward Functions", test_reward_functions),
-        ("Build Reward from Config", test_build_reward_from_config),
-        ("Adapter Imports", test_adapter_imports),
-        ("Adapter Factory", test_adapter_factory),
-        ("SMC Batched Denoise", test_smc_with_batched_denoise),
-        ("Evaluation Metrics", test_evaluation_metrics),
-        ("Squidiff Sampler Interface", test_squidiff_sampler_interface),
-        ("CellFlow Adapter Interface", test_cellflow_sampler_interface),
-    ]
-
-    passed = 0
-    failed = 0
-    errors = []
-
-    for name, test_fn in tests:
-        try:
-            print(f"\n[TEST] {name}...")
-            test_fn()
-            passed += 1
-        except Exception as e:
-            failed += 1
-            errors.append((name, str(e), traceback.format_exc()))
-            print(f"  [FAIL] {name}: {e}")
-
-    print("\n" + "=" * 60)
-    print(f"  Results: {passed} passed, {failed} failed out of {len(tests)} tests")
-    print("=" * 60)
-
-    if errors:
-        print("\nFailure Details:")
-        for name, msg, tb in errors:
-            print(f"\n--- {name} ---")
-            print(tb)
-
-    return failed == 0
+def test_signature_rewards_score_batches_not_individual_cells():
+    genes, ctrl, shifts, de_genes = reward_fixture()
+    reward = TranscriptomicReward(de_genes, shifts, ctrl, genes)
+    # Both particles have the same population mean but different cell states.
+    batches = torch.tensor(
+        [
+            [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+            [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        ]
+    )
+    scores = reward.compute(batches, "A+ctrl", timestep=0)
+    assert torch.allclose(scores[0], scores[1])
 
 
-if __name__ == "__main__":
-    success = main()
-    sys.exit(0 if success else 1)
+def test_anchor_prefers_training_derived_reference_distribution():
+    _, _, shifts, _ = reward_fixture()
+    ctrl_cells = torch.tensor([[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 1.0]])
+    reference = ctrl_cells + torch.tensor(shifts["A+ctrl"])
+    far = reference + 5.0
+    batches = torch.stack([reference, far])
+    reward = AnchorReward(shifts, bandwidth=1.0)
+    scores = reward.compute(batches, "A+ctrl", timestep=0, ctrl_cells=ctrl_cells)
+    assert scores[0] > scores[1]
+
+
+def test_composite_reward_normalizes_objective_scales():
+    class FixedReward:
+        def __init__(self, values, weight=1.0):
+            self.values = torch.tensor(values, dtype=torch.float32)
+            self.weight = weight
+
+        def compute(self, *args, **kwargs):
+            return self.values
+
+    composite = CompositeReward(
+        [FixedReward([0, 1, 2]), FixedReward([0, 1000, 2000])],
+        normalization="zscore",
+    )
+    values = composite.compute(torch.zeros(3, 2, 1), "A", 0)
+    assert values[0] < values[1] < values[2]
+    assert abs(float(values.mean())) < 1e-6
+
+
+def test_metrics_are_finite_and_deterministic():
+    rng = np.random.default_rng(3)
+    pred = rng.normal(size=(250, 5))
+    true = rng.normal(size=(260, 5))
+    assert energy_distance(pred, true) == energy_distance(pred, true)
+    assert mmd_rbf(pred, true) == mmd_rbf(pred, true)
+    assert pearson_delta(np.ones(5), np.ones(5), np.zeros(5)) == 0.0
+
+
+def test_invalid_configuration_fails_early():
+    with pytest.raises(ValueError, match="alpha"):
+        SMCEngine(IdentitySampler(), MeanReward(), make_config(alpha=0.0))

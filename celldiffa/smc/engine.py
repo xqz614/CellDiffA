@@ -9,25 +9,24 @@ Implements the Feynman-Kac SMC framework from DAS (Kim et al., ICLR 2025),
 adapted for population-level single-cell perturbation prediction.
 
 Key design decisions:
-    1. Incremental weight update (DAS-style): w_t ∝ exp((β_t - β_{t-1}) * r(x̂_0) / α)
-    2. Population-level output: returns a distribution (batch of cells), not a single sample.
-    3. Multi-objective biological rewards with optional Pareto aggregation.
-    4. Adaptive or linear tempering schedule.
+    1. Telescoping potential: log G_k = (β_k r_k - β_{k-1} r_{k-1}) / α.
+    2. Each particle is an empirical distribution (a batch of cells).
+    3. Reward components are optionally standardized before linear aggregation.
+    4. The terminal step retains weights for MAP or weighted output.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Protocol, Tuple
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from .resampler import Resampler, ResamplingStrategy
-
 
 # ============================================================
 # Protocol: Diffusion Model Sampler Interface
 # ============================================================
+
 
 class DiffusionSamplerProtocol(Protocol):
     """
@@ -48,7 +47,9 @@ class DiffusionSamplerProtocol(Protocol):
         Perform one reverse diffusion step.
 
         Args:
-            x_t: Noisy samples at timestep t. Shape: (batch_size, num_genes)
+            x_t: Noisy cells at timestep t. Shape: (batch_size, num_genes).
+                The engine flattens the particle and cell axes before calling
+                the sampler.
             t: Current timestep tensor. Shape: (batch_size,)
             condition: Conditioning information (perturbation embedding, etc.)
             prev_pred: Previous x0 prediction for self-conditioning. Shape: (batch_size, num_genes)
@@ -74,13 +75,17 @@ class DiffusionSamplerProtocol(Protocol):
 # SMC Configuration
 # ============================================================
 
+
 @dataclass
 class SMCConfig:
     """Configuration for the SMC test-time alignment engine."""
 
     # Particle settings
     num_particles: int = 100
-    """Number of SMC particles (cells to generate in parallel)."""
+    """Number of SMC particles. Each particle is a batch of cells."""
+
+    cells_per_particle: int = 32
+    """Number of cells in each distribution-valued particle."""
 
     # Resampling settings
     resampling_strategy: str = "systematic"
@@ -91,7 +96,7 @@ class SMCConfig:
 
     # Tempering / Annealing (DAS-style)
     tempering_schedule: str = "linear"
-    """How β_t grows from 0 to 1: 'linear', 'cosine', 'adaptive'."""
+    """How β_t grows from 0 to 1: 'linear' or 'cosine'."""
 
     alpha: float = 1.0
     """Reward temperature α: controls reward-KL tradeoff in p_tar ∝ p_pre * exp(r/α).
@@ -112,28 +117,33 @@ class SMCConfig:
     """Classifier-free guidance strength for the base model."""
 
     # Output aggregation
-    output_mode: str = "all"
-    """How to aggregate final particles: 'weighted_mean', 'top_k', 'all'."""
+    output_mode: str = "map"
+    """How to aggregate final batch particles: 'map', 'weighted_mean',
+    'top_k', or 'all'."""
 
     top_k: int = 50
     """Number of top particles to keep if output_mode='top_k'."""
 
     # Computational
     device: str = "cuda"
-    batch_size_per_step: int = 100
-    """Max particles processed in one forward pass (for memory management)."""
+    batch_size_per_step: int = 256
+    """Maximum number of cells processed in one model forward pass."""
+
+    seed: int = 42
+    """Sampling seed. Reusing it across conditions enables paired comparisons."""
 
 
 # ============================================================
 # SMC Engine
 # ============================================================
 
+
 class SMCEngine:
     """
     Sequential Monte Carlo engine for test-time alignment of diffusion models.
 
-    Implements DAS-style incremental importance weighting:
-        log w_t^(n) += (β_t - β_{t-1}) * r(x̂_0^(n)) / α
+    Implements a telescoping Feynman-Kac potential:
+        log w_k^(n) += (β_k r_k - β_{k-1} r_{k-1}) / α
 
     where β_t is the tempering coefficient at step t, r is the composite
     biological reward, and α is the reward temperature.
@@ -158,10 +168,9 @@ class SMCEngine:
         self.model = model_sampler
         self.reward_fn = reward_fn
         self.config = config or SMCConfig()
-        self.resampler = Resampler(
-            strategy=ResamplingStrategy(self.config.resampling_strategy)
-        )
+        self.resampler = Resampler(strategy=ResamplingStrategy(self.config.resampling_strategy))
         self.device = torch.device(self.config.device)
+        self._validate_config()
 
     def sample_with_alignment(
         self,
@@ -199,18 +208,46 @@ class SMCEngine:
         if G is None:
             raise ValueError("Must provide either ctrl_cells or num_genes.")
 
+        # A particle represents an empirical distribution B^(n) in R^(M x G),
+        # not one cell. This is the central population-level semantics described
+        # by CellDiffA.
+        if ctrl_cells is not None:
+            if ctrl_cells.ndim != 2:
+                raise ValueError("ctrl_cells must have shape (cells, genes).")
+            if ctrl_cells.shape[0] < 2:
+                raise ValueError("At least two control cells are required.")
+            if ctrl_cells.shape[1] != G:
+                raise ValueError(f"ctrl_cells has {ctrl_cells.shape[1]} genes but num_genes={G}.")
+            ctrl_cells = ctrl_cells.to(self.device, dtype=torch.float32)
+            M = min(self.config.cells_per_particle, ctrl_cells.shape[0])
+            ctrl_cells = ctrl_cells[:M]
+        else:
+            M = self.config.cells_per_particle
+
         # Determine start timestep
         start_t = self.config.start_timestep if self.config.start_timestep is not None else (T - 1)
-        start_t = min(start_t, T - 1)
+        start_t = max(0, min(start_t, T - 1))
 
-        # Step 0: Initialize particles as pure noise
-        x_t = self.model.sample_noise(shape=(N, G), device=self.device)
+        # Step 0: initialize N distribution-valued particles, each containing M cells.
+        torch.manual_seed(self.config.seed)
+        if self.device.type == "cuda":
+            torch.cuda.manual_seed_all(self.config.seed)
+        x_t = self.model.sample_noise(shape=(N, M, G), device=self.device)
+        if x_t.shape != (N, M, G):
+            raise ValueError(
+                f"Sampler returned noise shape {tuple(x_t.shape)}, expected {(N, M, G)}."
+            )
 
         # Initialize log-weights to zero (uniform)
         log_weights = torch.zeros(N, device=self.device)
 
         # Self-conditioning: track previous x0 prediction
-        prev_pred = torch.zeros(N, G, device=self.device)
+        prev_pred = torch.zeros(N, M, G, device=self.device)
+
+        # Stores beta_{k-1} * r_{k-1}. The incremental potential
+        # beta_k*r_k - beta_{k-1}*r_{k-1} telescopes to the desired terminal
+        # reward when no resampling occurs and is the standard Feynman-Kac form.
+        previous_log_potential = torch.zeros(N, device=self.device)
 
         # Tracking
         ess_history = []
@@ -232,8 +269,8 @@ class SMCEngine:
             with torch.no_grad():
                 output = self._batched_denoise(x_t, t_tensor, condition_emb, prev_pred)
 
-            x_prev = output["x_prev"]       # (N, G) - denoised one step
-            x0_pred = output["x0_pred"]      # (N, G) - x_start prediction
+            x_prev = output["x_prev"]  # (N, M, G) - denoised one step
+            x0_pred = output["x0_pred"]  # (N, M, G) - clean-batch prediction
 
             # Update self-conditioning state
             prev_pred = x0_pred.clone()
@@ -246,34 +283,44 @@ class SMCEngine:
                 condition=condition,
                 timestep=t,
                 ctrl_cells=ctrl_cells,
-            )  # (N,) scalar reward per particle
+            )  # (N,) scalar reward per distribution-valued particle
+
+            if rewards.shape != (N,):
+                raise ValueError(
+                    f"Reward must return one value per particle, expected {(N,)}, "
+                    f"got {tuple(rewards.shape)}."
+                )
+            if not torch.isfinite(rewards).all():
+                raise ValueError("Reward returned NaN or infinite values.")
 
             # ----------------------------------------------------------
-            # Step 3: Incremental weight update (DAS-style)
-            #   log w_t += (β_t - β_{t-1}) * r / α
+            # Step 3: telescoping incremental potential.
             # ----------------------------------------------------------
             beta_t = beta_schedule[step_idx]
-            beta_prev = beta_schedule[step_idx - 1] if step_idx > 0 else 0.0
-            delta_beta = beta_t - beta_prev
-
-            log_weights = log_weights + (delta_beta / self.config.alpha) * rewards
+            current_log_potential = beta_t * rewards
+            log_weights = (
+                log_weights + (current_log_potential - previous_log_potential) / self.config.alpha
+            )
 
             # Normalize weights for ESS computation
             log_weights_normalized = log_weights - torch.logsumexp(log_weights, dim=0)
             weights = torch.exp(log_weights_normalized)
 
             # Compute ESS
-            ess = 1.0 / (weights ** 2).sum().item()
+            ess = 1.0 / (weights**2).sum().item()
             ess_history.append(ess)
 
             # ----------------------------------------------------------
             # Step 3b: Conditional resampling (if ESS drops below threshold)
             # ----------------------------------------------------------
             did_resample = False
-            if ess < self.config.ess_threshold * N:
+            # Do not resample at the terminal step: keeping the terminal weights
+            # makes MAP and weighted-mean aggregation well-defined.
+            if step_idx < num_steps - 1 and ess < self.config.ess_threshold * N:
                 indices = self.resampler.resample(weights, N)
                 x_prev = x_prev[indices]
                 prev_pred = prev_pred[indices]
+                current_log_potential = current_log_potential[indices]
                 log_weights = torch.zeros(N, device=self.device)  # Reset weights
                 did_resample = True
 
@@ -281,6 +328,7 @@ class SMCEngine:
 
             # Update particles
             x_t = x_prev
+            previous_log_potential = current_log_potential
 
             if return_trajectory:
                 trajectory.append(x_t.clone().cpu())
@@ -288,9 +336,7 @@ class SMCEngine:
         # ----------------------------------------------------------
         # Step 4: Output aggregation
         # ----------------------------------------------------------
-        final_weights = torch.exp(
-            log_weights - torch.logsumexp(log_weights, dim=0)
-        )
+        final_weights = torch.exp(log_weights - torch.logsumexp(log_weights, dim=0))
         output_samples = self._aggregate_output(x_t, final_weights)
 
         result = {
@@ -299,6 +345,7 @@ class SMCEngine:
             "ess_history": ess_history,
             "resample_history": resample_history,
             "all_particles": x_t.cpu(),
+            "cells_per_particle": M,
         }
         if return_trajectory:
             result["trajectory"] = trajectory
@@ -308,6 +355,24 @@ class SMCEngine:
     # ------------------------------------------------------------------
     # Private methods
     # ------------------------------------------------------------------
+
+    def _validate_config(self) -> None:
+        if self.config.num_particles < 2:
+            raise ValueError("num_particles must be at least 2.")
+        if self.config.cells_per_particle < 2:
+            raise ValueError("cells_per_particle must be at least 2.")
+        if not 0 < self.config.ess_threshold <= 1:
+            raise ValueError("ess_threshold must be in (0, 1].")
+        if self.config.alpha <= 0:
+            raise ValueError("alpha must be positive.")
+        if self.config.batch_size_per_step < 1:
+            raise ValueError("batch_size_per_step must be positive.")
+        if self.config.tempering_schedule not in {"linear", "cosine"}:
+            raise ValueError("tempering_schedule must be 'linear' or 'cosine'.")
+        if self.config.output_mode not in {"map", "weighted_mean", "top_k", "all"}:
+            raise ValueError("Unknown output_mode.")
+        if self.config.output_mode == "top_k" and self.config.top_k < 1:
+            raise ValueError("top_k must be positive.")
 
     def _build_tempering_schedule(self, num_steps: int) -> List[float]:
         """
@@ -331,16 +396,7 @@ class SMCEngine:
 
         elif schedule == "cosine":
             # Cosine schedule: slower at start, faster at end
-            return [
-                0.5 * (1 - np.cos(np.pi * k / (num_steps - 1)))
-                for k in range(num_steps)
-            ]
-
-        elif schedule == "adaptive":
-            # Placeholder for adaptive tempering (to be implemented)
-            # In adaptive mode, β_t is chosen so that ESS stays above threshold.
-            # For now, fall back to linear.
-            return [k / (num_steps - 1) for k in range(num_steps)]
+            return [0.5 * (1 - np.cos(np.pi * k / (num_steps - 1))) for k in range(num_steps)]
 
         else:
             raise ValueError(f"Unknown tempering schedule: {schedule}")
@@ -357,34 +413,81 @@ class SMCEngine:
 
         Handles expanding condition tensors to match batch size.
         """
-        N = x_t.shape[0]
+        N, M, G = x_t.shape
         bs = self.config.batch_size_per_step
 
-        if N <= bs:
-            return self.model.denoise_step(x_t, t, condition_emb, prev_pred=prev_pred)
+        # Base diffusion models denoise cells independently. Flatten the
+        # particle/cell axes for the model, then restore (N, M, G).
+        total_cells = N * M
+        flat_x = x_t.reshape(total_cells, G)
+        flat_prev = prev_pred.reshape(total_cells, G)
+        flat_t = t[:, None].expand(N, M).reshape(total_cells)
 
         outputs = {"x_prev": [], "x0_pred": []}
-        for i in range(0, N, bs):
-            end = min(i + bs, N)
-            batch_out = self.model.denoise_step(
-                x_t[i:end], t[i:end], condition_emb, prev_pred=prev_pred[i:end]
+        for i in range(0, total_cells, bs):
+            end = min(i + bs, total_cells)
+            batch_condition = self._condition_batch(
+                condition_emb, start=i, end=end, total=total_cells, cells_per_particle=M
             )
+            batch_out = self.model.denoise_step(
+                flat_x[i:end], flat_t[i:end], batch_condition, prev_pred=flat_prev[i:end]
+            )
+            for key in ("x_prev", "x0_pred"):
+                if key not in batch_out or batch_out[key].shape != flat_x[i:end].shape:
+                    actual = None if key not in batch_out else tuple(batch_out[key].shape)
+                    raise ValueError(
+                        f"Sampler output '{key}' has shape {actual}; "
+                        f"expected {tuple(flat_x[i:end].shape)}."
+                    )
             outputs["x_prev"].append(batch_out["x_prev"])
             outputs["x0_pred"].append(batch_out["x0_pred"])
 
         return {
-            "x_prev": torch.cat(outputs["x_prev"], dim=0),
-            "x0_pred": torch.cat(outputs["x0_pred"], dim=0),
+            "x_prev": torch.cat(outputs["x_prev"], dim=0).reshape(N, M, G),
+            "x0_pred": torch.cat(outputs["x0_pred"], dim=0).reshape(N, M, G),
         }
 
-    def _aggregate_output(
-        self, particles: torch.Tensor, weights: torch.Tensor
-    ) -> torch.Tensor:
+    def _condition_batch(
+        self,
+        condition: Dict,
+        start: int,
+        end: int,
+        total: int,
+        cells_per_particle: int,
+    ) -> Dict:
+        """Select/broadcast condition values for a flattened cell mini-batch."""
+        batch_size = end - start
+        cell_indices = torch.arange(start, end) % cells_per_particle
+        selected = {}
+        for key, value in condition.items():
+            if isinstance(value, torch.Tensor) and value.ndim > 0:
+                if value.shape[0] == total:
+                    selected[key] = value[start:end]
+                elif value.shape[0] == cells_per_particle:
+                    selected[key] = value.index_select(0, cell_indices.to(value.device))
+                elif value.shape[0] == 1:
+                    selected[key] = value.expand(batch_size, *value.shape[1:])
+                else:
+                    selected[key] = value
+            elif isinstance(value, list):
+                if len(value) == total:
+                    selected[key] = value[start:end]
+                elif len(value) == cells_per_particle:
+                    selected[key] = [value[j] for j in cell_indices.tolist()]
+                elif len(value) == 1:
+                    selected[key] = value * batch_size
+                else:
+                    selected[key] = value
+            else:
+                selected[key] = value
+        return selected
+
+    def _aggregate_output(self, particles: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
         """
         Aggregate final particles into output based on configured mode.
 
         Args:
-            particles: Final particle states. Shape: (N, G)
+            particles: Final particle batches. Shape: (N, M, G)
             weights: Normalized particle weights. Shape: (N,)
 
         Returns:
@@ -392,19 +495,23 @@ class SMCEngine:
         """
         mode = self.config.output_mode
 
+        if mode == "map":
+            # Return the highest-weight empirical distribution (M, G).
+            return particles[torch.argmax(weights)]
+
         if mode == "weighted_mean":
-            # Single consensus cell (weighted average)
-            return (particles * weights.unsqueeze(1)).sum(dim=0, keepdim=True)
+            # Barycentric consensus over aligned cell positions (M, G).
+            return (particles * weights[:, None, None]).sum(dim=0)
 
         elif mode == "top_k":
-            # Return top-K highest-weight particles as the generated population
+            # Concatenate cells from the top-K distribution particles.
             k = min(self.config.top_k, particles.shape[0])
             _, top_indices = torch.topk(weights, k)
-            return particles[top_indices]
+            return particles[top_indices].flatten(0, 1)
 
         elif mode == "all":
-            # Return all particles (for downstream distribution analysis)
-            return particles
+            # Flatten all particle batches into one cell population.
+            return particles.flatten(0, 1)
 
         else:
             raise ValueError(f"Unknown output_mode: {mode}")

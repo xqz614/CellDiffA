@@ -72,7 +72,9 @@ class PerturbDiffSampler:
         self.device = torch.device(device)
         self.guidance_strength = guidance_strength
         self.eta = eta
-        self._start_time = start_time
+        if start_time < 1:
+            raise ValueError("start_time must be positive.")
+        self._start_time = min(start_time, diffusion.num_timesteps)
         self.clip_denoised = clip_denoised
 
         # Pre-extract schedule parameters as tensors
@@ -117,8 +119,9 @@ class PerturbDiffSampler:
         N, G = x_t.shape
         self.model.eval()
 
-        # Use stored condition_dict (expanded to N particles)
-        cond = self.condition_dict
+        # The engine supplies a mini-batch-aligned condition. Fall back to the
+        # condition stored at construction for native sampling.
+        cond = condition or self.condition_dict
 
         # --- Build model input with self-conditioning ---
         # PerturbDiff concatenates prev_pred along last dim: x_in = [x_t, prev_pred]
@@ -134,29 +137,35 @@ class PerturbDiffSampler:
 
         # Control input: cont_emb with zeros for self-cond
         # cont_emb shape from condition_dict: (1, 1, G) → expand to (N, 1, G)
-        cont_emb = cond["cont_emb"].expand(N, -1, -1)  # (N, 1, G)
+        cont_emb = self._match_batch(cond["cont_emb"], N)  # (N, 1, G)
         control_zeros = torch.zeros_like(cont_emb)
         control_input = torch.cat([cont_emb, control_zeros], dim=-1)  # (N, 1, 2G)
 
         # Expand batch_emb: (1, D) → (N, D)
-        batch_emb = cond["batch_emb"].expand(N, -1)
+        batch_emb = self._match_batch(cond["batch_emb"], N)
 
         # Expand gene_emb if present: (1, G, 5120) → (N, G, 5120)
         gene_emb = cond.get("gene_emb")
         if gene_emb is not None:
-            gene_emb = gene_emb.expand(N, -1, -1)
+            gene_emb = self._match_batch(gene_emb, N)
+
+        ds_name = cond["ds_name"]
+        if len(ds_name) == 1:
+            ds_name = ds_name * N
+        elif len(ds_name) != N:
+            raise ValueError(f"ds_name batch has length {len(ds_name)}, expected 1 or {N}.")
 
         # Build self_condition for Cross_DiT
         model_cond = {
             "batch_emb": batch_emb,
             "cont_emb": cont_emb,
             "gene_emb": gene_emb,
-            "ds_name": cond["ds_name"],
+            "ds_name": ds_name,
         }
 
         # Timestep: Cross_DiT expects (N, 1) after _scale_timesteps
         # PerturbDiff uses rescale_timesteps: t_scaled = t * 1000/T
-        rescale = getattr(self.diffusion, 'rescale_timesteps', False)
+        rescale = getattr(self.diffusion, "rescale_timesteps", False)
         if rescale:
             t_float = t.float() * (1000.0 / self.diffusion.num_timesteps)
         else:
@@ -173,7 +182,7 @@ class PerturbDiffSampler:
 
         # NOTE: In PerturbDiff source, process_xstart (clipping) is applied AFTER CFG.
         # We must NOT clip before CFG computation.
-        cutoff = getattr(self.model.model_cfg, 'cutoff', 0.0) if self.clip_denoised else 0.0
+        cutoff = getattr(self.model.model_cfg, "cutoff", 0.0) if self.clip_denoised else 0.0
 
         pred_xstart = model_output  # raw, unclipped
 
@@ -183,7 +192,7 @@ class PerturbDiffSampler:
             # This matches PerturbDiff source: self_condition={"gene_emb": ..., "ds_name": ...}
             uncond_cond = {
                 "gene_emb": gene_emb,
-                "ds_name": cond["ds_name"],
+                "ds_name": ds_name,
             }
             with torch.no_grad():
                 uncond_output = self.model(
@@ -199,7 +208,9 @@ class PerturbDiffSampler:
 
             eps_cond = (x_t - sqrt_alpha * pred_xstart) / sqrt_one_minus_alpha
             eps_uncond = (x_t - sqrt_alpha * uncond_xstart) / sqrt_one_minus_alpha
-            eps_guided = (1 + self.guidance_strength) * eps_cond - self.guidance_strength * eps_uncond
+            eps_guided = (
+                1 + self.guidance_strength
+            ) * eps_cond - self.guidance_strength * eps_uncond
 
             # Convert back to x_start
             pred_xstart = (x_t - sqrt_one_minus_alpha * eps_guided) / sqrt_alpha
@@ -216,13 +227,15 @@ class PerturbDiffSampler:
         eps = (x_t - torch.sqrt(alpha_bar) * pred_xstart) / torch.sqrt(1.0 - alpha_bar)
 
         # DDIM formula
-        sigma = self.eta * torch.sqrt(
-            (1 - alpha_bar_prev) / (1 - alpha_bar)
-        ) * torch.sqrt(1 - alpha_bar / alpha_bar_prev)
+        sigma = (
+            self.eta
+            * torch.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar))
+            * torch.sqrt(1 - alpha_bar / alpha_bar_prev)
+        )
 
         mean_pred = (
             pred_xstart * torch.sqrt(alpha_bar_prev)
-            + torch.sqrt(1 - alpha_bar_prev - sigma ** 2) * eps
+            + torch.sqrt(1 - alpha_bar_prev - sigma**2) * eps
         )
 
         # Add noise only if t > 0 and eta > 0
@@ -234,6 +247,14 @@ class PerturbDiffSampler:
             "x_prev": x_prev,
             "x0_pred": pred_xstart,
         }
+
+    @staticmethod
+    def _match_batch(value: torch.Tensor, batch_size: int) -> torch.Tensor:
+        if value.shape[0] == batch_size:
+            return value
+        if value.shape[0] == 1:
+            return value.expand(batch_size, *value.shape[1:])
+        raise ValueError(f"Condition batch has size {value.shape[0]}, expected 1 or {batch_size}.")
 
 
 class PerturbDiffAdapter(BaseAdapter):
@@ -268,6 +289,8 @@ class PerturbDiffAdapter(BaseAdapter):
         self._pert_dict = None
         self._cell_type_dict = None
         self._batch_dict = None
+        self._cov_cfg = None
+        self._gene_embedding_matrix = None
 
         # Add PerturbDiff to path
         if self.perturbdiff_path not in sys.path:
@@ -278,6 +301,7 @@ class PerturbDiffAdapter(BaseAdapter):
         checkpoint_path: str,
         gene_names: Optional[List[str]] = None,
         ctrl_adata=None,
+        **kwargs,
     ) -> None:
         """
         Load a pre-trained PerturbDiff checkpoint.
@@ -303,11 +327,14 @@ class PerturbDiffAdapter(BaseAdapter):
 
         # Extract dictionaries from checkpoint hparams
         hparams = self._pl_model.hparams
-        cov_cfg = hparams.get("cov_encoding_cfg", None)
+        cov_cfg = getattr(self._pl_model, "cov_encoding_cfg", None)
+        if cov_cfg is None:
+            cov_cfg = hparams.get("cov_encoding_cfg", None)
         if cov_cfg is not None:
-            self._pert_dict = getattr(cov_cfg, 'pert_dict', {})
-            self._cell_type_dict = getattr(cov_cfg, 'cell_type_dict', {})
-            self._batch_dict = getattr(cov_cfg, 'batch_dict', {})
+            self._cov_cfg = cov_cfg
+            self._pert_dict = dict(self._cfg_get(cov_cfg, "pert_dict", {}) or {})
+            self._cell_type_dict = dict(self._cfg_get(cov_cfg, "cell_type_dict", {}) or {})
+            self._batch_dict = dict(self._cfg_get(cov_cfg, "batch_dict", {}) or {})
 
         # Gene names
         self._gene_names = gene_names
@@ -318,26 +345,23 @@ class PerturbDiffAdapter(BaseAdapter):
         # Build gene_name_embedding_cache if model uses gene embeddings
         # PerturbDiff's gene_embedding module requires a pre-built cache
         # mapping ds_name -> (G, 5120) tensor of gene name embeddings.
-        if (
-            self._pl_model.gene_embedding is not None
-            and gene_names is not None
-            and not self._pl_model.gene_name_embedding_cache
-        ):
-            try:
-                from src.apps.sampling.sampling_generation_helpers import (
-                    build_gene_embedding_cache,
+        if self._pl_model.gene_embedding is not None and gene_names is None:
+            raise ValueError("gene_names are required by this PerturbDiff checkpoint.")
+        if self._pl_model.gene_embedding is not None and gene_names is not None:
+            embedding_dict = self._pl_model.gene_embedding
+            if not embedding_dict:
+                raise ValueError(
+                    "Checkpoint requires gene embeddings, but no embedding table was loaded."
                 )
-                # build_gene_embedding_cache populates the model's internal cache
-                build_gene_embedding_cache(
-                    self._pl_model,
-                    gene_names=gene_names,
-                    ds_name="norman",  # default; can be overridden per-call
+            example = next(iter(embedding_dict.values()))
+            missing = [name for name in gene_names if name not in embedding_dict]
+            vectors = [embedding_dict.get(name, torch.zeros_like(example)) for name in gene_names]
+            self._gene_embedding_matrix = torch.stack(vectors)
+            if missing:
+                print(
+                    f"[PerturbDiffAdapter] Warning: {len(missing)}/{len(gene_names)} "
+                    "genes have no name embedding and use zeros."
                 )
-                print("[PerturbDiffAdapter] Gene embedding cache built successfully.")
-            except (ImportError, Exception) as e:
-                # If the helper is unavailable, gene_emb will be None (model handles gracefully)
-                print(f"[PerturbDiffAdapter] Warning: Could not build gene embedding cache: {e}")
-                print("  → gene_emb will be None (model uses null_emb fallback).")
 
         self.is_trained = True
 
@@ -376,10 +400,30 @@ class PerturbDiffAdapter(BaseAdapter):
         # PerturbDiff's CovEncoder does `pert_input + 1` before embedding lookup,
         # so -1 + 1 = 0 → index 0 is the reserved neutral/control slot.
         # This is the official behavior from dataset_core.py line 166-171.
-        pert_idx = self._pert_dict.get(perturbation, -1) if self._pert_dict else -1
-        ct_idx = self._cell_type_dict.get(cell_type, 0) if self._cell_type_dict else 0
+        pert_idx = self._lookup_perturbation(perturbation)
+        if self._cell_type_dict:
+            ct_idx = self._lookup_case_insensitive(self._cell_type_dict, cell_type, default=None)
+            if ct_idx is None:
+                raise ValueError(
+                    f"Cell type '{cell_type}' is absent from the checkpoint vocabulary."
+                )
+        else:
+            ct_idx = 0
         batch_key = f"{ds_name}_{batch_name}" if self._batch_dict else batch_name
-        batch_idx = self._batch_dict.get(batch_key, 0) if self._batch_dict else 0
+        if self._batch_dict:
+            batch_idx = self._lookup_case_insensitive(self._batch_dict, batch_key, default=None)
+            if batch_idx is None and batch_name == "default":
+                candidates = [
+                    value
+                    for key, value in self._batch_dict.items()
+                    if str(key).lower().startswith(f"{ds_name.lower()}_")
+                ]
+                if len(candidates) == 1:
+                    batch_idx = candidates[0]
+            if batch_idx is None:
+                raise ValueError(f"Batch '{batch_key}' is absent from the checkpoint vocabulary.")
+        else:
+            batch_idx = 0
 
         pert_tensor = torch.tensor([pert_idx], dtype=torch.long, device=device)
         ct_tensor = torch.tensor([ct_idx], dtype=torch.long, device=device)
@@ -392,34 +436,78 @@ class PerturbDiffAdapter(BaseAdapter):
 
         # --- Control expression ---
         if ctrl_expr is None:
-            # Use zeros as fallback (not ideal but won't crash)
-            G = len(self._gene_names) if self._gene_names else 2000
-            cont_emb = torch.zeros(1, 1, G, device=device)
+            raise ValueError("ctrl_expr is required for PerturbDiff conditioning.")
         else:
             if ctrl_expr.dim() == 1:
                 cont_emb = ctrl_expr.unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, G)
             elif ctrl_expr.dim() == 2:
-                # Take mean of control population
-                cont_emb = ctrl_expr.mean(dim=0, keepdim=True).unsqueeze(0).to(device)  # (1, 1, G)
+                # Preserve the control population: one control cell conditions
+                # each generated cell in the distribution particle.
+                cont_emb = ctrl_expr.unsqueeze(1).to(device)  # (M, 1, G)
             else:
                 cont_emb = ctrl_expr.to(device)
 
         # --- Gene embeddings ---
         gene_emb = None
         if self._pl_model.gene_embedding is not None and ds_name:
+            if (
+                ds_name not in self._pl_model.gene_name_embedding_cache
+                and self._gene_embedding_matrix is not None
+            ):
+                self._pl_model.gene_name_embedding_cache[ds_name] = self._gene_embedding_matrix
             # Check cache first
             if ds_name in self._pl_model.gene_name_embedding_cache:
                 gene_emb = self._pl_model.gene_name_embedding_cache[ds_name].unsqueeze(0).to(device)
             # Otherwise gene_emb stays None (model handles this gracefully)
 
         condition_dict = {
-            "batch_emb": batch_emb,           # (1, D)
-            "cont_emb": cont_emb,             # (1, 1, G)
-            "gene_emb": gene_emb,             # (1, G, 5120) or None
-            "ds_name": [[ds_name]],           # nested list matching PerturbDiff format
+            "batch_emb": batch_emb,  # (1, D)
+            "cont_emb": cont_emb,  # (M, 1, G)
+            "gene_emb": gene_emb,  # (1, G, embedding_dim) or None
+            "ds_name": [[ds_name]],
         }
 
         return condition_dict
+
+    @staticmethod
+    def _lookup_case_insensitive(mapping: Dict, key: str, default):
+        if key in mapping:
+            return mapping[key]
+        lowered = {str(k).lower(): v for k, v in mapping.items()}
+        return lowered.get(key.lower(), default)
+
+    @staticmethod
+    def _cfg_get(config, key: str, default=None):
+        if isinstance(config, dict):
+            return config.get(key, default)
+        return getattr(config, key, default)
+
+    def _lookup_perturbation(self, perturbation: str) -> int:
+        if not self._pert_dict:
+            return -1
+        if perturbation in self._pert_dict:
+            return self._pert_dict[perturbation]
+
+        # One-hot PerturbDiff reserves input -1 (embedding index 0 after +1)
+        # as the neutral perturbation. Other encoders index directly and must
+        # use an explicit control entry instead of Python's accidental -1 index.
+        pert_encoding = self._cfg_get(self._cov_cfg, "pert_encoding", "onehot")
+        drug_encoding = self._cfg_get(self._cov_cfg, "drug_encoding", "onehot")
+        gene_encoding = self._cfg_get(self._cov_cfg, "replogle_gene_encoding", "onehot")
+        if (
+            pert_encoding != "non"
+            and drug_encoding != "chemberta_cls"
+            and gene_encoding != "genept"
+        ):
+            return -1
+
+        for control_name in ("ctrl", "control", "non-targeting", "vehicle"):
+            if control_name in self._pert_dict:
+                return self._pert_dict[control_name]
+        raise ValueError(
+            f"Perturbation '{perturbation}' is absent from the checkpoint vocabulary, "
+            "and this covariate encoder has no explicit control token."
+        )
 
     def get_diffusion_sampler(
         self,
@@ -477,12 +565,22 @@ class PerturbDiffAdapter(BaseAdapter):
             raise RuntimeError("Model not loaded. Call load_checkpoint() first.")
 
         results = {}
+        batch_name = kwargs.get("batch_name", "default")
+        ds_name = kwargs.get("ds_name", "norman")
         for cond_str in conditions:
+            condition_ctrl = ctrl_expr
+            if condition_ctrl is not None and condition_ctrl.dim() == 2:
+                if condition_ctrl.shape[0] < n_samples:
+                    repeats = (n_samples + condition_ctrl.shape[0] - 1) // condition_ctrl.shape[0]
+                    condition_ctrl = condition_ctrl.repeat(repeats, 1)
+                condition_ctrl = condition_ctrl[:n_samples]
             # Build condition
             cond_dict = self.build_condition(
                 perturbation=cond_str,
                 cell_type=cell_type,
-                ctrl_expr=ctrl_expr,
+                batch_name=batch_name,
+                ctrl_expr=condition_ctrl,
+                ds_name=ds_name,
             )
 
             # Create sampler

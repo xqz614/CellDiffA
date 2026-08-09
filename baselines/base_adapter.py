@@ -6,17 +6,19 @@ evaluation pipeline can treat them interchangeably.
 """
 
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import numpy as np
-from anndata import AnnData
+
+if TYPE_CHECKING:
+    from anndata import AnnData
 
 
 class BaseAdapter(ABC):
     """
     Abstract base class for baseline model adapters.
 
-    Each adapter encapsulates a specific baseline model (GEARS, CPA, PerturbDiff, etc.)
+    Each adapter encapsulates a validated baseline model (currently GEARS or PerturbDiff)
     and exposes a unified interface for training, prediction, and (optionally)
     providing a diffusion sampler for CellDiffA's SMC engine.
     """
@@ -29,8 +31,8 @@ class BaseAdapter(ABC):
     @abstractmethod
     def fit(
         self,
-        adata_train: AnnData,
-        adata_val: Optional[AnnData] = None,
+        adata_train: "AnnData",
+        adata_val: Optional["AnnData"] = None,
         **kwargs,
     ) -> None:
         """
@@ -67,7 +69,7 @@ class BaseAdapter(ABC):
         self,
         checkpoint_path: str,
         gene_names: Optional[List[str]] = None,
-        ctrl_adata: Optional[AnnData] = None,
+        ctrl_adata: Optional["AnnData"] = None,
         **kwargs,
     ) -> None:
         """
@@ -99,15 +101,13 @@ class BaseAdapter(ABC):
         Returns:
             Condition dictionary compatible with get_diffusion_sampler().
         """
-        raise NotImplementedError(
-            f"{self.model_name} does not support condition building."
-        )
+        raise NotImplementedError(f"{self.model_name} does not support condition building.")
 
     def get_diffusion_sampler(self, condition_dict: Dict = None, **kwargs):
         """
         Return a diffusion sampler object compatible with CellDiffA's SMC engine.
 
-        Only diffusion-based models (PerturbDiff, Squidiff, scDFM) need to implement this.
+        Only diffusion-based models such as PerturbDiff implement this.
         Non-diffusion models should raise NotImplementedError.
 
         Args:
