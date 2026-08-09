@@ -54,6 +54,7 @@ def main() -> None:
     sys.path.insert(0, str(upstream_root))
 
     import torch
+    from hydra import compose, initialize_config_dir
 
     from src.apps.run import rawdata_diffusion_sampling as upstream
     from src.models.lightning.lightning_module import PlModel
@@ -86,9 +87,26 @@ def main() -> None:
         )
 
     # rawdata_diffusion_sampling imported the loader into its module namespace;
-    # replacing that reference keeps the official Hydra app and sampling flow.
+    # replacing that reference keeps the official model and sampling flow.
     upstream.load_sampling_model = load_sampling_model
-    upstream.main()
+
+    # Calling the decorated upstream main after importing it makes Hydra treat
+    # ../../../configs as a Python package. PerturbDiff's configs directory is
+    # not a package, so compose from its absolute filesystem path and invoke
+    # the original task function retained by functools.wraps.
+    config_dir = upstream_root / "configs"
+    if not config_dir.is_dir():
+        raise SystemExit(f"Missing PerturbDiff config directory: {config_dir}")
+    task_function = getattr(upstream.main, "__wrapped__", None)
+    if task_function is None:
+        raise RuntimeError("Unable to access the upstream Hydra task function.")
+
+    with initialize_config_dir(version_base=None, config_dir=str(config_dir)):
+        cfg = compose(
+            config_name="rawdata_diffusion_sampling",
+            overrides=sys.argv[1:],
+        )
+    task_function(cfg)
 
 
 if __name__ == "__main__":
