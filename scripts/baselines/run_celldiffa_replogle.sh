@@ -31,6 +31,7 @@ perturb_data_root="$data_root/PerturbDiff_data"
 checkpoint_root="$data_root/checkpoints/PerturbDiff_release_ckpt"
 source_h5ad="$perturb_data_root/finetune_data/nadig_processed_data/replogle.h5ad"
 selected_genes="$perturb_data_root/selected_genes/replogle_real_selected_genes.pkl"
+perturbation_embeddings="$perturb_data_root/gene_names/replogle_gene_emb_dict_perturbation_emb_dict.pkl"
 real_test="${CELLDIFFA_REAL_TEST:-$repo_root/results/replogle/reference/real.h5ad}"
 split_config="$perturbdiff_root_abs/configs/data/perturb_data/replogle.yaml"
 entrypoint="$repo_root/scripts/baselines/run_celldiffa_replogle.py"
@@ -66,6 +67,7 @@ for path in \
   "$perturbdiff_root_abs/src/apps/run/rawdata_diffusion_sampling.py" \
   "$source_h5ad" \
   "$selected_genes" \
+  "$perturbation_embeddings" \
   "$real_test" \
   "$split_config" \
   "$checkpoint"
@@ -94,6 +96,7 @@ celldiffa_args=(
   "--real-test" "$real_test"
   "--split-config" "$split_config"
   "--selected-genes" "$selected_genes"
+  "--perturbation-embeddings" "$perturbation_embeddings"
   "--prior-cache" "$output_dir/training_priors.npz"
   "--shard-root" "$output_dir/shards"
   "--output" "$output_dir/celldiffa_${variant}.h5ad"

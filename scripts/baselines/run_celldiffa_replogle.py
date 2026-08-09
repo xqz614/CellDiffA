@@ -21,6 +21,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--real-test", required=True)
     parser.add_argument("--split-config", required=True)
     parser.add_argument("--selected-genes", required=True)
+    parser.add_argument("--perturbation-embeddings", required=True)
     parser.add_argument("--prior-cache", required=True)
     parser.add_argument("--shard-root", required=True)
     parser.add_argument("--output", required=True)
@@ -31,6 +32,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--alpha", type=float, default=1.0)
     parser.add_argument("--top-de", type=int, default=20)
     parser.add_argument("--anchor-bandwidth", type=float, default=1.0)
+    parser.add_argument("--prior-ridge", type=float, default=1.0)
     parser.add_argument("--worker-index", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=1)
     parser.add_argument("--max-groups", type=int)
@@ -89,7 +91,12 @@ def main() -> None:
     from src.common.utils import setup_loggings
 
     from baselines.adapter_perturbdiff import PerturbDiffSampler
-    from celldiffa.benchmark.artifacts import load_selected_genes, sha256_file, write_manifest
+    from celldiffa.benchmark.artifacts import (
+        load_embedding_dict,
+        load_selected_genes,
+        sha256_file,
+        write_manifest,
+    )
     from celldiffa.benchmark.perturbdiff_split import PerturbDiffSplit
     from celldiffa.benchmark.replogle_priors import compute_replogle_training_priors
     from celldiffa.benchmark.replogle_shards import (
@@ -115,11 +122,14 @@ def main() -> None:
         args.real_test,
         args.split_config,
         args.selected_genes,
+        args.perturbation_embeddings,
     ]
     for value in required:
         if not Path(value).exists():
             raise FileNotFoundError(value)
     selected_genes = load_selected_genes(args.selected_genes)
+    perturbation_embeddings = load_embedding_dict(args.perturbation_embeddings)
+    embedding_sha256 = sha256_file(args.perturbation_embeddings)
     split = PerturbDiffSplit.from_yaml(args.split_config, split_axis="context")
     real = ad.read_h5ad(args.real_test)
     split.validate_real_test(real)
@@ -144,6 +154,7 @@ def main() -> None:
         "source": str(Path(args.source).resolve()),
         "selected_genes": str(Path(args.selected_genes).resolve()),
         "selected_genes_sha256": sha256_file(args.selected_genes),
+        "perturbation_embeddings_sha256": embedding_sha256,
         "split_config_sha256": sha256_file(args.split_config),
         "upstream_revision": revision,
         "num_particles": args.num_particles,
@@ -152,6 +163,7 @@ def main() -> None:
         "alpha": args.alpha,
         "top_de": args.top_de,
         "anchor_bandwidth": args.anchor_bandwidth,
+        "prior_ridge": args.prior_ridge,
         "seed": args.seed,
         "normalize_counts": float(cfg.data.normalize_counts or 1.0),
         "cell_set": int(cfg.data.use_cell_set),
@@ -165,14 +177,15 @@ def main() -> None:
     # mixing of shards from different CellDiffA settings.
     with (shard_root / ".prepare.lock").open("w") as lock_handle:
         fcntl.flock(lock_handle, fcntl.LOCK_EX)
+        observed = None
         if run_config_path.exists():
             observed = json.loads(run_config_path.read_text(encoding="utf-8"))
-            if observed != run_config:
+            if observed != run_config and any(shard_root.glob("group_*.npz")):
                 raise ValueError(
                     "Existing shard directory was created with different settings. "
                     "Use a new output directory instead of mixing runs."
                 )
-        else:
+        if not run_config_path.exists() or observed != run_config:
             write_manifest(run_config_path, run_config)
         priors = compute_replogle_training_priors(
             args.source,
@@ -182,6 +195,9 @@ def main() -> None:
             expression_key="X_hvg",
             top_k=max(args.top_de, 50),
             target_perturbations=test_perturbations,
+            perturbation_embeddings=perturbation_embeddings,
+            embedding_signature=embedding_sha256,
+            ridge_penalty=args.prior_ridge,
         )
         fcntl.flock(lock_handle, fcntl.LOCK_UN)
 
@@ -372,8 +388,11 @@ def main() -> None:
         "official_split": str(Path(args.split_config).resolve()),
         "prior_policy": (
             "official training mask only; context-specific control centering; "
+            "unobserved test perturbations use training-only GenePT dual ridge; "
             "no held-out perturbed expression"
         ),
+        "prior_sources": priors.sources,
+        "prior_ridge": args.prior_ridge,
         "evaluation_genes": len(selected_genes),
         "normalization_scale": normalize_counts,
         "num_particles": args.num_particles,

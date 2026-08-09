@@ -94,6 +94,9 @@ def test_celldiffa_launcher_supports_resumable_worker_and_smoke_args(tmp_path):
     genes = perturb_data / "selected_genes/replogle_real_selected_genes.pkl"
     genes.parent.mkdir(parents=True)
     genes.touch()
+    embeddings = perturb_data / "gene_names/replogle_gene_emb_dict_perturbation_emb_dict.pkl"
+    embeddings.parent.mkdir(parents=True)
+    embeddings.touch()
     real = tmp_path / "real.h5ad"
     real.parent.mkdir(parents=True, exist_ok=True)
     real.touch()
