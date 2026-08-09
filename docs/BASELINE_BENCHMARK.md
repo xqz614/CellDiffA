@@ -169,6 +169,68 @@ Copy one of the resulting `diffusion_true_*.h5ad` files to
 `results/replogle/reference/real.h5ad`, then verify that both runs produced the
 same ordered real test matrix before evaluating them together.
 
+## CellDiffA on the released Replogle task
+
+CellDiffA reuses the released PerturbDiff DataModule, checkpoint, covariate
+encoder, 32-cell set layout, and official DDIM single step. SMC particles are
+complete 32-cell populations; the implementation never flattens them into
+independent cells. Rewards are evaluated in the ordered 2,000-gene benchmark
+space, while the finetuned checkpoint still samples in its native 12,626-gene
+space. Padded cells are retained for Cross-DiT attention but excluded from all
+rewards and saved predictions.
+
+The prior cache uses only rows in PerturbDiff's official training mask. For
+each test perturbation it subtracts the control mean of the corresponding cell
+line before pooling shifts. Held-out perturbed expression is never read by the
+reward or copied into a prediction; the held-out HepG2 controls remain the
+model condition, as in the released task.
+
+First run one cell set as a smoke test (no evaluator-ready H5AD is written for
+a partial run):
+
+```bash
+conda activate celldiffa-perturbdiff
+export CELLDIFFA_DATA_ROOT=/data/users/jchengak/DiffA/CellDiffA/data
+
+bash scripts/baselines/run_celldiffa_replogle.sh \
+  scratch results/replogle/celldiffa_scratch_smoke 2 0 1 1
+```
+
+For the primary finetuned result, one GPU can run the complete resumable job:
+
+```bash
+bash scripts/baselines/run_celldiffa_replogle.sh \
+  finetuned results/replogle/celldiffa_finetuned 2
+```
+
+Every official cell set is saved atomically under `shards/`. Repeating the same
+command skips valid completed shards. To use all eight GPUs, open eight tmux
+windows and run one command per worker, changing both the physical GPU and
+worker index from 0 through 7:
+
+```bash
+bash scripts/baselines/run_celldiffa_replogle.sh \
+  finetuned results/replogle/celldiffa_finetuned 0 0 8 all
+```
+
+After every worker completes, assemble the shared shards. Assembly fails rather
+than writing a partial file if any perturbation has the wrong cell count:
+
+```bash
+python scripts/baselines/assemble_celldiffa_replogle.py \
+  --real-test results/replogle/reference/real.h5ad \
+  --shard-root results/replogle/celldiffa_finetuned/shards \
+  --output results/replogle/celldiffa_finetuned/celldiffa_finetuned.h5ad
+
+python scripts/baselines/evaluate.py \
+  --real results/replogle/reference/real.h5ad \
+  --pred results/replogle/celldiffa_finetuned/celldiffa_finetuned.h5ad \
+  --outdir results/replogle/metrics/celldiffa_finetuned \
+  --pert-col gene \
+  --control-pert non-targeting \
+  --num-threads 32
+```
+
 ## Linear on Replogle
 
 The Replogle runner translates the equations in the pinned official

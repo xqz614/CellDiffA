@@ -31,6 +31,11 @@ class MockDiffusion:
     alphas_cumprod_prev = np.array([1.0, 0.5], dtype=np.float32)
     rescale_timesteps = False
 
+    def ddim_sample(self, model, x_t, t, **kwargs):
+        assert x_t.ndim == 3
+        assert kwargs["prev_pred"].shape == x_t.shape
+        return {"sample": x_t - 1, "pred_xstart": x_t + 1}
+
 
 def test_cfg_is_applied_before_expression_cutoff():
     model = MockCrossDiT()
@@ -56,6 +61,33 @@ def test_cfg_is_applied_before_expression_cutoff():
         prev_pred=torch.zeros(4, 3),
     )
     assert torch.allclose(output["x0_pred"], torch.ones(4, 3), atol=1e-6)
+
+
+def test_population_sampling_delegates_to_official_ddim_step():
+    model = MockCrossDiT()
+    condition = {
+        "batch_emb": torch.zeros(2, 3, 2),
+        "cont_emb": torch.zeros(2, 3, 4),
+        "gene_emb": None,
+        "ds_name": [["replogle"], ["replogle"]],
+    }
+    sampler = PerturbDiffSampler(
+        SimpleNamespace(model=model),
+        MockDiffusion(),
+        condition,
+        device="cpu",
+        start_time=2,
+    )
+    x_t = torch.zeros(2, 3, 4)
+    output = sampler.denoise_step(
+        x_t,
+        torch.zeros(2, dtype=torch.long),
+        condition,
+        prev_pred=torch.zeros_like(x_t),
+    )
+    assert sampler.population_native is True
+    assert output["x_prev"].shape == (2, 3, 4)
+    assert torch.all(output["x0_pred"] == 1)
 
 
 def test_non_onehot_unknown_perturbation_never_uses_negative_index():

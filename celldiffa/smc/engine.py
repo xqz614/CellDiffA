@@ -47,9 +47,9 @@ class DiffusionSamplerProtocol(Protocol):
         Perform one reverse diffusion step.
 
         Args:
-            x_t: Noisy cells at timestep t. Shape: (batch_size, num_genes).
-                The engine flattens the particle and cell axes before calling
-                the sampler.
+            x_t: Noisy cells at timestep t. Cell-wise samplers receive
+                ``(batch_size, num_genes)``. Population-native samplers receive
+                ``(particle_batch, cells_per_particle, num_genes)``.
             t: Current timestep tensor. Shape: (batch_size,)
             condition: Conditioning information (perturbation embedding, etc.)
             prev_pred: Previous x0 prediction for self-conditioning. Shape: (batch_size, num_genes)
@@ -414,6 +414,9 @@ class SMCEngine:
         Handles expanding condition tensors to match batch size.
         """
         N, M, G = x_t.shape
+        if getattr(self.model, "population_native", False):
+            return self._batched_population_denoise(x_t, t, condition_emb, prev_pred)
+
         bs = self.config.batch_size_per_step
 
         # Base diffusion models denoise cells independently. Flatten the
@@ -446,6 +449,83 @@ class SMCEngine:
             "x_prev": torch.cat(outputs["x_prev"], dim=0).reshape(N, M, G),
             "x0_pred": torch.cat(outputs["x0_pred"], dim=0).reshape(N, M, G),
         }
+
+    def _batched_population_denoise(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        condition_emb: Dict[str, torch.Tensor],
+        prev_pred: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """Batch particles while preserving the model's cell-set axis.
+
+        PerturbDiff's Cross-DiT attends across the cells in a set. Flattening
+        ``(particle, cell)`` into independent rows changes the released model,
+        so its adapter opts into this path with ``population_native = True``.
+        """
+        n_particles, n_cells, n_genes = x_t.shape
+        particle_batch = max(1, self.config.batch_size_per_step // n_cells)
+        outputs = {"x_prev": [], "x0_pred": []}
+        for start in range(0, n_particles, particle_batch):
+            end = min(start + particle_batch, n_particles)
+            condition = self._population_condition_batch(
+                condition_emb,
+                start=start,
+                end=end,
+                total=n_particles,
+            )
+            batch_out = self.model.denoise_step(
+                x_t[start:end],
+                t[start:end],
+                condition,
+                prev_pred=prev_pred[start:end],
+            )
+            expected = (end - start, n_cells, n_genes)
+            for key in ("x_prev", "x0_pred"):
+                actual = None if key not in batch_out else tuple(batch_out[key].shape)
+                if actual != expected:
+                    raise ValueError(
+                        f"Population sampler output '{key}' has shape {actual}; "
+                        f"expected {expected}."
+                    )
+                outputs[key].append(batch_out[key])
+        return {key: torch.cat(value, dim=0) for key, value in outputs.items()}
+
+    @staticmethod
+    def _population_condition_batch(
+        condition: Dict,
+        *,
+        start: int,
+        end: int,
+        total: int,
+    ) -> Dict:
+        """Select or broadcast one cell-set condition over particle batches."""
+        batch_size = end - start
+        selected = {}
+        for key, value in condition.items():
+            if isinstance(value, torch.Tensor) and value.ndim > 0:
+                if value.shape[0] == total:
+                    selected[key] = value[start:end]
+                elif value.shape[0] == 1:
+                    selected[key] = value.expand(batch_size, *value.shape[1:])
+                else:
+                    raise ValueError(
+                        f"Population condition {key!r} has leading size {value.shape[0]}; "
+                        f"expected 1 or {total}."
+                    )
+            elif isinstance(value, list):
+                if len(value) == total:
+                    selected[key] = value[start:end]
+                elif len(value) == 1:
+                    selected[key] = value * batch_size
+                else:
+                    raise ValueError(
+                        f"Population condition {key!r} has length {len(value)}; "
+                        f"expected 1 or {total}."
+                    )
+            else:
+                selected[key] = value
+        return selected
 
     def _condition_batch(
         self,
