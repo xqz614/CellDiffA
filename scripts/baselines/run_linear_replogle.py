@@ -179,6 +179,7 @@ def main() -> None:
         ),
         "split_policy": "PerturbDiff official masks; validation/test expression excluded",
         "prediction_population": "official deterministic pseudobulk mean repeated per test cell",
+        "output_projection": "maximum(raw_log1p_prediction, 0.0) for Cell-Eval validity",
         "implementation": (
             "Python translation of official PCA and two-sided ridge equations; "
             "deterministic truncated SVD replaces prcomp_irlba"

@@ -8,6 +8,7 @@ import pytest
 import yaml
 
 from celldiffa.benchmark.linear_replogle import (
+    LinearFit,
     fit_official_linear,
     pca_scores,
     training_pseudobulk,
@@ -150,6 +151,25 @@ def test_external_perturbation_embedding_supports_non_expression_target():
     )
     prediction = fit.predict_means(["unseen"], output_genes=["g2", "g4"])
     assert prediction["unseen"].shape == (2,)
+
+
+def test_predictions_are_projected_to_nonnegative_log_expression():
+    fit = LinearFit(
+        gene_scores=np.asarray([[1.0], [2.0]]),
+        coefficients=np.asarray([[-1.0]]),
+        response_center=np.zeros(2),
+        control_baseline=np.zeros(2),
+        genes=("g1", "g2"),
+        perturbation_names=("target",),
+        perturbation_scores=np.asarray([[1.0]]),
+        training_conditions=("ctrl",),
+        pca_dim=1,
+        ridge_penalty=0.1,
+    )
+
+    prediction = fit.predict_means(["target"])["target"]
+
+    np.testing.assert_array_equal(prediction, np.zeros(2))
 
 
 def test_linear_rejects_non_gene_test_perturbation():
