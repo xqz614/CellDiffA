@@ -15,6 +15,7 @@ from pathlib import Path
 import anndata as ad
 import numpy as np
 import pandas as pd
+from scipy.sparse.linalg import svds
 
 from .perturbdiff_split import PerturbDiffSplit
 from .streaming import iter_h5ad_expression
@@ -31,7 +32,12 @@ class LinearFit:
     pca_dim: int
     ridge_penalty: float
 
-    def predict_means(self, perturbations: list[str]) -> dict[str, np.ndarray]:
+    def predict_means(
+        self,
+        perturbations: list[str],
+        *,
+        output_genes: list[str] | None = None,
+    ) -> dict[str, np.ndarray]:
         gene_to_position = {gene: position for position, gene in enumerate(self.genes)}
         missing = sorted(set(perturbations) - set(gene_to_position))
         if missing:
@@ -48,6 +54,14 @@ class LinearFit:
             + self.response_center[:, None]
             + self.control_baseline[:, None]
         )
+        if output_genes is not None:
+            missing_outputs = sorted(set(output_genes) - set(gene_to_position))
+            if missing_outputs:
+                raise ValueError(
+                    "Linear output genes are absent from the fitting expression space; "
+                    f"missing={missing_outputs[:20]}."
+                )
+            values = values[[gene_to_position[gene] for gene in output_genes]]
         return {pert: values[:, index].copy() for index, pert in enumerate(perturbations)}
 
 
@@ -132,8 +146,9 @@ def training_pseudobulk(
 def pca_scores(matrix: np.ndarray, *, n_components: int) -> np.ndarray:
     """Equivalent principal-component scores to R ``prcomp_irlba``.
 
-    Full deterministic SVD is used because the PerturbDiff space is only 2,000
-    genes.  PCA signs are arbitrary and cancel in the two-sided ridge model.
+    Deterministic truncated SVD solves the same leading-component objective as
+    ``irlba`` without materializing a full decomposition of the 12,626-gene
+    Replogle matrix. PCA signs are arbitrary and cancel in the ridge model.
     """
     matrix = np.asarray(matrix, dtype=np.float64)
     if matrix.ndim != 2:
@@ -145,8 +160,15 @@ def pca_scores(matrix: np.ndarray, *, n_components: int) -> np.ndarray:
             f"choose 1..{max_components}."
         )
     centered = matrix - matrix.mean(axis=0, keepdims=True)
-    left, singular_values, _ = np.linalg.svd(centered, full_matrices=False)
-    return left[:, :n_components] * singular_values[:n_components]
+    left, singular_values, _ = svds(
+        centered,
+        k=n_components,
+        which="LM",
+        v0=np.ones(min(centered.shape), dtype=np.float64),
+        solver="arpack",
+    )
+    order = np.argsort(singular_values)[::-1]
+    return left[:, order] * singular_values[order]
 
 
 def fit_official_linear(
