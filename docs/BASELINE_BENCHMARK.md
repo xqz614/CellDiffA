@@ -172,10 +172,10 @@ same ordered real test matrix before evaluating them together.
 ## Linear on Replogle
 
 The Replogle runner translates the equations in the pinned official
-`run_linear_pretrained_model.R`: condition pseudobulk, a shared 10-dimensional
-PCA for gene and perturbation embeddings, and two-sided ridge regression with
-penalty 0.1. It uses deterministic truncated SVD for the same rank-10 PCA
-objective as `prcomp_irlba`. No R or GPU is needed.
+`run_linear_pretrained_model.R`: condition pseudobulk, a 10-dimensional PCA for
+gene embeddings, external perturbation embeddings, and two-sided ridge
+regression with penalty 0.1. It uses deterministic truncated SVD for the same
+rank-10 PCA objective as `prcomp_irlba`. No R or GPU is needed.
 
 Fitting uses the full `X`/`var_names` gene space from the released Replogle
 H5AD for gene-side PCA. Perturbation-side vectors use PerturbDiff's released
