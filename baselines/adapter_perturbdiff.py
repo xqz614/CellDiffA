@@ -39,6 +39,8 @@ class PerturbDiffSampler:
         5. DDIM deterministic steps
     """
 
+    population_native = True
+
     def __init__(
         self,
         pl_model,
@@ -116,6 +118,27 @@ class PerturbDiffSampler:
         Returns:
             Dict with 'x_prev' and 'x0_pred'.
         """
+        # Use PerturbDiff's own single DDIM step for its native population
+        # tensor. This preserves Cross-DiT attention across the cell-set axis
+        # and prevents this adapter from drifting from upstream sampling math.
+        if x_t.ndim == 3:
+            cond = condition or self.condition_dict
+            with torch.no_grad():
+                output = self.diffusion.ddim_sample(
+                    self.model,
+                    x_t,
+                    t,
+                    self_condition=cond,
+                    clip_denoised=self.clip_denoised,
+                    eta=self.eta,
+                    guidance_strength=self.guidance_strength,
+                    prev_pred=prev_pred,
+                    sample_kwargs={},
+                )
+            return {"x_prev": output["sample"], "x0_pred": output["pred_xstart"]}
+        if x_t.ndim != 2:
+            raise ValueError(f"PerturbDiff expects a 2-D or 3-D tensor, got {x_t.shape}.")
+
         N, G = x_t.shape
         self.model.eval()
 

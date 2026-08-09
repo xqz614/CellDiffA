@@ -112,3 +112,32 @@ class CompositeReward:
             f"CompositeReward(aggregation={self.aggregation}, "
             f"normalization={self.normalization}, rewards=[{reward_strs}])"
         )
+
+
+class ProjectedReward:
+    """Apply a fixed cell/gene projection before evaluating a reward.
+
+    This lets a model sample in its native feature space while CellDiffA uses
+    the ordered evaluation genes. A cell mask also prevents padded members of
+    a PerturbDiff cell set from affecting rewards.
+    """
+
+    def __init__(self, reward, *, gene_indices=None, cell_mask=None):
+        self.reward = reward
+        self.gene_indices = gene_indices
+        self.cell_mask = cell_mask
+
+    def compute(self, x_pred, condition, timestep, **kwargs):
+        ctrl_cells = kwargs.get("ctrl_cells")
+        if self.cell_mask is not None:
+            mask = torch.as_tensor(self.cell_mask, dtype=torch.bool, device=x_pred.device)
+            x_pred = x_pred[:, mask]
+            if ctrl_cells is not None:
+                ctrl_cells = ctrl_cells[mask]
+        if self.gene_indices is not None:
+            indices = torch.as_tensor(self.gene_indices, dtype=torch.long, device=x_pred.device)
+            x_pred = x_pred.index_select(-1, indices)
+            if ctrl_cells is not None:
+                ctrl_cells = ctrl_cells.index_select(-1, indices)
+        kwargs["ctrl_cells"] = ctrl_cells
+        return self.reward.compute(x_pred, condition, timestep, **kwargs)

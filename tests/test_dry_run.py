@@ -8,7 +8,7 @@ import torch
 import yaml
 
 from celldiffa.evaluation.metrics import energy_distance, mmd_rbf, pearson_delta
-from celldiffa.rewards import AnchorReward, CompositeReward, TranscriptomicReward
+from celldiffa.rewards import AnchorReward, CompositeReward, ProjectedReward, TranscriptomicReward
 from celldiffa.smc import Resampler, ResamplingStrategy, SMCConfig, SMCEngine
 
 
@@ -116,6 +116,38 @@ def test_condition_rows_follow_cells_across_forward_minibatches():
     assert sampler.seen == [0, 1, 2, 0, 1, 2]
 
 
+def test_population_native_sampler_keeps_cell_set_axis():
+    class PopulationSampler(IdentitySampler):
+        population_native = True
+
+        def __init__(self):
+            super().__init__(timesteps=1)
+            self.shapes = []
+
+        def denoise_step(self, x_t, t, condition, prev_pred=None):
+            self.shapes.append(tuple(x_t.shape))
+            assert condition["cont_emb"].shape[:2] == x_t.shape[:2]
+            return {"x_prev": x_t, "x0_pred": x_t}
+
+    sampler = PopulationSampler()
+    engine = SMCEngine(
+        sampler,
+        MeanReward(),
+        make_config(
+            num_particles=5,
+            cells_per_particle=3,
+            start_timestep=0,
+            batch_size_per_step=6,
+        ),
+    )
+    engine.sample_with_alignment(
+        condition="A",
+        condition_emb={"cont_emb": torch.zeros(1, 3, 2)},
+        ctrl_cells=torch.zeros(3, 2),
+    )
+    assert sampler.shapes == [(2, 3, 2), (2, 3, 2), (1, 3, 2)]
+
+
 def reward_fixture():
     genes = ["g0", "g1", "g2"]
     ctrl = np.zeros(3, dtype=np.float32)
@@ -165,6 +197,23 @@ def test_composite_reward_normalizes_objective_scales():
     values = composite.compute(torch.zeros(3, 2, 1), "A", 0)
     assert values[0] < values[1] < values[2]
     assert abs(float(values.mean())) < 1e-6
+
+
+def test_projected_reward_removes_padding_and_non_evaluation_genes():
+    class ShapeReward:
+        def compute(self, x_pred, condition, timestep, ctrl_cells=None):
+            assert x_pred.shape == (2, 2, 2)
+            assert ctrl_cells.shape == (2, 2)
+            return x_pred.mean(dim=(1, 2))
+
+    reward = ProjectedReward(ShapeReward(), gene_indices=[2, 0], cell_mask=[True, False, True])
+    scores = reward.compute(
+        torch.arange(24, dtype=torch.float32).reshape(2, 3, 4),
+        "A",
+        0,
+        ctrl_cells=torch.zeros(3, 4),
+    )
+    assert scores.shape == (2,)
 
 
 def test_metrics_are_finite_and_deterministic():
