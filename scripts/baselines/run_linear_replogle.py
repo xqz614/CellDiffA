@@ -32,7 +32,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--selected-genes", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--model-output", help="Optional fitted .npz path")
-    parser.add_argument("--expression-key", default="X_hvg")
+    parser.add_argument(
+        "--expression-key",
+        default="X",
+        help=(
+            "Expression space used to learn PCA and perturbation embeddings. Replogle must "
+            "use full X because many CRISPR targets are outside the 2,000 evaluation HVGs."
+        ),
+    )
     parser.add_argument("--mode", choices=["pooled", "heldout_only"], default="pooled")
     parser.add_argument("--pca-dim", type=int, default=10)
     parser.add_argument("--ridge-penalty", type=float, default=0.1)
@@ -71,6 +78,20 @@ def main() -> None:
     if list(real.var_names.astype(str)) != selected_genes:
         raise ValueError("Selected-gene pickle order differs from the real-test H5AD.")
 
+    source_backed = ad.read_h5ad(source, backed="r")
+    try:
+        if args.expression_key == "X":
+            fit_genes = list(source_backed.var_names.astype(str))
+        elif args.expression_key == "X_hvg":
+            fit_genes = selected_genes
+        else:
+            raise ValueError(
+                "Linear currently supports expression-key X (full fitting space) or "
+                "X_hvg (evaluation space)."
+            )
+    finally:
+        source_backed.file.close()
+
     pseudobulk, conditions, counts = training_pseudobulk(
         source,
         split=split,
@@ -78,15 +99,15 @@ def main() -> None:
         mode=args.mode,
         chunk_size=args.chunk_size,
     )
-    if pseudobulk.shape[1] != len(selected_genes):
+    if pseudobulk.shape[1] != len(fit_genes):
         raise ValueError(
             f"Source {args.expression_key} has {pseudobulk.shape[1]} genes, but "
-            f"the selected-gene file has {len(selected_genes)}."
+            f"the inferred fitting gene space has {len(fit_genes)}."
         )
     fit = fit_official_linear(
         pseudobulk,
         conditions,
-        selected_genes,
+        fit_genes,
         control_pert=split.control_pert,
         pca_dim=args.pca_dim,
         ridge_penalty=args.ridge_penalty,
@@ -94,7 +115,7 @@ def main() -> None:
 
     labels = real.obs[split.pert_col].astype(str).to_numpy()
     test_perts = sorted(set(labels) - {split.control_pert})
-    predicted_means = fit.predict_means(test_perts)
+    predicted_means = fit.predict_means(test_perts, output_genes=selected_genes)
     predictions = {
         pert: np.repeat(
             mean[None, :],
@@ -136,6 +157,8 @@ def main() -> None:
         "output": str(output_path),
         "model_output": str(model_path),
         "expression_key": args.expression_key,
+        "fitting_genes": len(fit_genes),
+        "evaluation_genes": len(selected_genes),
         "pca_dim": args.pca_dim,
         "ridge_penalty": args.ridge_penalty,
         "holdout_contexts": list(split.holdout_contexts),

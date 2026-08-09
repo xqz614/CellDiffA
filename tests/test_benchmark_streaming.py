@@ -7,7 +7,14 @@ from scipy import sparse
 from celldiffa.benchmark.streaming import iter_h5ad_expression
 
 
-@pytest.mark.parametrize("matrix", [np.arange(30).reshape(10, 3), sparse.csr_matrix(np.eye(10, 3))])
+@pytest.mark.parametrize(
+    "matrix",
+    [
+        np.arange(30).reshape(10, 3),
+        sparse.csr_matrix(np.eye(10, 3)),
+        sparse.csc_matrix(np.eye(10, 3)),
+    ],
+)
 def test_stream_h5ad_obsm_dense_and_csr(tmp_path, matrix):
     adata = ad.AnnData(
         X=sparse.csr_matrix((10, 2)),

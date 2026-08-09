@@ -174,9 +174,14 @@ same ordered real test matrix before evaluating them together.
 The Replogle runner translates the equations in the pinned official
 `run_linear_pretrained_model.R`: condition pseudobulk, a shared 10-dimensional
 PCA for gene and perturbation embeddings, and two-sided ridge regression with
-penalty 0.1. It uses deterministic full SVD instead of `prcomp_irlba`; this is
-the same rank-10 PCA objective without randomized approximation. No R or GPU is
-needed.
+penalty 0.1. It uses deterministic truncated SVD for the same rank-10 PCA
+objective as `prcomp_irlba`. No R or GPU is needed.
+
+Fitting uses the full `X`/`var_names` gene space from the released Replogle
+H5AD so every CRISPR target can receive a training-data PCA embedding. Only the
+ordered 2,000 genes in `X_hvg`/`replogle_real_selected_genes.pkl` are written to
+the prediction file for evaluation. The two spaces must not be conflated:
+many held-out perturbation targets are intentionally absent from the 2,000 HVGs.
 
 `pooled` is the primary PerturbDiff-aligned result: every row in the official
 training mask is used and context is ignored, matching the context-agnostic
