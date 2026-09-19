@@ -1,6 +1,6 @@
 # Replogle local experiment record
 
-Updated 2026-09-19, 19:28 China time. This is an execution record, not a claim
+Updated 2026-09-19, 21:56 China time. This is an execution record, not a claim
 that the full baseline suite or AdaCell experiments have finished. A baseline is
 complete only after a full prediction artifact passes the shared contract and
 the full published evaluation finishes. Unit tests and smoke runs do not count.
@@ -31,12 +31,13 @@ the full published evaluation finishes. Unit tests and smoke runs do not count.
 | Four Mean variants | **Complete**, all 380 test perturbations evaluated |
 | Linear | **Complete**, all 380 test perturbations evaluated |
 | Scouter | **Complete**, validation-selected checkpoint, all 380 test perturbations evaluated |
-| PerturbDiff Scratch test | Full resumable native sampling running; evaluation follows automatically |
-| PerturbDiff Finetuned test | Queued behind Scratch in the running job |
+| PerturbDiff Scratch test | **Complete**, full predictions and all 14 metrics for 380 test conditions |
+| PerturbDiff Finetuned test | Full resumable native sampling running; evaluation follows automatically |
 | PerturbDiff Scratch validation | **Complete**, all 60 validation perturbations evaluated |
 | GEARS | Native training/prediction smoke passed; full training running |
 | CPA | **Complete**, all 13 epochs, full predictions and all 14 metrics for 380 test conditions |
-| STATE / CellFlow / Squidiff | Native training/prediction smoke passed; full runs pending |
+| STATE / CellFlow | Native training/prediction smoke passed; full runs pending |
+| Squidiff | Full CPU training started; test prediction deferred until unknown-gene policy is settled |
 | AdaCell Scratch validation | First full validation run running; no complete AdaCell result yet |
 | AdaCell Finetuned / test runs | Await validation selection and locked settings |
 | Compute-matched controls / ablations | Nine validation cases prepared per backbone; budget checks tested; full experiments pending |
@@ -93,7 +94,7 @@ is a smoke run and never produces evaluator-ready full results.
   cloned best checkpoints rather than retaining a mutable state dictionary.
   Held-out expression is never used as the prediction input.
 - No full local result was available at the initial checkpoint; seven test baselines
-  are now fully evaluated, as listed above.
+  were fully evaluated at 19:28; Scratch subsequently became the eighth.
 - HF HTTP/2 interrupted a large transfer. Downloader now uses HTTP/1.1 and
   external retries that retain the current partial-file resume offset.
 - Published cached test group counts contain 26,878 cells in 13,219 nonempty
@@ -114,9 +115,10 @@ each trainable adapter. Native sources must be checked out at their registry pin
 | `scripts/baselines/run_gears_replogle_local.py` | `adacell-replogle` | `--output-dir results/replogle/gears_extended --device mps` |
 | `scripts/baselines/run_state_replogle.py` | `adacell-state` | `--output-dir results/replogle/state --device mps` |
 | `scripts/baselines/run_cellflow_replogle.py` | `adacell-cellflow` | `--embeddings data/PerturbDiff_data/gene_names/replogle_gene_emb_dict_perturbation_emb_dict.pkl` |
-| `scripts/baselines/run_squidiff_replogle.py` | `adacell-replogle` | `--unseen-policy zero_shift` only with the limitation below disclosed |
+| `scripts/baselines/run_squidiff_replogle.py` | `adacell-replogle` | Current run: `--stage train --device cpu --num-threads 4 --output-dir results/replogle/squidiff_cpu` |
 
-Each full adapter writes `predictions.h5ad`. Run the shared evaluator from
+Each full prediction stage writes `predictions.h5ad`; Squidiff's training-only
+stage intentionally does not. Run the shared evaluator from
 `adacell-replogle`, **not STATE's newer bundled Cell-Eval**:
 
 ```bash
@@ -188,11 +190,55 @@ distribution distances. These are descriptive checks, not proofs of realism.
 - Some native progress files call a full-run *request* `complete_run`. Only final
   prediction artifacts and complete evaluation coverage establish completion.
 
-Remaining: full training/evaluation of pending baselines, both full released
-backbone evaluations, validation-only steering selection for both backbones,
+Remaining: full training/evaluation of pending baselines, the full finetuned
+backbone evaluation, validation-only steering selection for both backbones,
 locked full test runs, compute-matched controls, reward ablations, independent
 diagnostics, multiple seeds and biological case studies. No SOTA or preserved-
 diversity claim is established yet.
+
+## Squidiff checkpoint audit and training-only run
+
+On 2026-09-19, the author confirmed releases of some dataset-specific weights
+in [Figshare](https://doi.org/10.6084/m9.figshare.27948633), with an explicit
+[warning against direct use on unrelated datasets](https://github.com/siyuh/Squidiff/issues/5#issuecomment-3821393851).
+Both the Figshare browser page and public file-list API returned HTTP 403 in
+this environment. This is **not evidence that no Replogle weights exist**;
+no compatible weight with the required gene order and training-split provenance
+could be verified. The official PerturbDiff Hugging Face model repository lists
+seven PerturbDiff checkpoints and no Squidiff checkpoint. Its public main branch
+`31be89cb8cce5dddef0782bac29d5c748ce55931` has no Squidiff baseline adapter.
+No third-party weight was substituted or claimed to reproduce that baseline.
+
+The user authorized training if no directly usable checkpoint could be verified.
+The independent native-model run uses the full 611,710 training rows, 2,000
+ordered genes, batch size 64, AdamW learning rate 1e-4, EMA 0.9999, and a
+100,000-update cap. The full official validation reference selects the best EMA
+checkpoint every 5,000 updates, with patience 5. CPU execution uses four threads
+to avoid adding a fourth MPS job; it still shares CPU and memory resources.
+
+```bash
+PYTHONPATH=. OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 \
+conda run --no-capture-output -n adacell-replogle \
+  python -u scripts/baselines/run_squidiff_replogle.py \
+  --stage train --device cpu --num-threads 4 \
+  --iterations 100000 --batch-size 64 --validation-every 5000 --patience 5 \
+  --split-config external/PerturbDiff/configs/data/perturb_data/replogle.yaml \
+  --output-dir results/replogle/squidiff_cpu
+```
+
+This command resumes the same training run; do not launch a second copy while
+the first is active. The active log is `results/replogle/logs/squidiff_cpu_train.log`.
+`training_progress.json` distinguishes running training from completed training.
+`best.pt` is selected on validation only; `last.pt` saves the optimizer and RNG
+state every 1,000 updates. Input checksums prevent resuming against changed data.
+Training-only mode does not open the test reference, construct latent test
+effects, enable zero-shift fallback, or produce a test prediction artifact.
+`--stage predict` is a separate, explicit action after training; the default
+unknown-gene policy remains `error`.
+
+Verification: 89 tests passed (5 MPS tests deselected while other jobs use MPS).
+The native CPU smoke completed two optimizer steps, validation and checkpoint
+serialization without reading test responses. It is not a full baseline result.
 
 ## Parallel work completed at 19:28
 
