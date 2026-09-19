@@ -8,7 +8,10 @@ from the training split.
 
 > Research status: the population-level SMC core is tested and the PerturbDiff
 > adapter is aligned with the upstream sampling implementation. This repository
-> does not include a trained checkpoint or claim benchmark results yet.
+> does not include data or model weights. Replogle experiments are in progress;
+> see the [execution record](docs/REPLOGLE_LOCAL_RUN.md) for completed evaluations
+> versus running, smoke-tested and pending work. AdaCell's full experimental
+> claims are not established yet.
 
 ## Method contract
 
@@ -16,7 +19,7 @@ One particle is an empirical cell distribution, not one cell:
 
 ```text
 particles          B_t: [N particles, M cells, G genes]
-base-model input       : [N*M cells, G genes]
+native backbone input  : [N*B blocks, S cells per native block, G genes]
 reward output          : [N particles]
 ```
 
@@ -34,10 +37,13 @@ The default reward is a normalized linear combination of:
 
 - `r_DEG`: population-mean agreement on training-derived response genes;
 - `r_manifold`: cosine alignment of the population-mean shift;
-- `r_anchor`: negative linear-time RBF MMD to a training-derived reference
+- `r_anchor`: negative all-pairs RBF MMD to a training-derived reference
   distribution (control cells transported by available training shifts).
 
-Held-out perturbation cells are used only for final evaluation.
+Test perturbation cells are used only for final evaluation. Official validation
+responses may select checkpoints and steering hyperparameters. Candidate-wise
+reward normalization is adaptive; the telescoping identity alone does not
+establish a fixed target density or a finite-sample KL bound in that setting.
 
 ## Supported integrations
 
@@ -48,6 +54,11 @@ Earlier experimental adapters for CPA, scDFM, Squidiff, and CellFlow were
 removed because they did not implement the corresponding upstream APIs
 faithfully. Add a new adapter only with a pinned upstream revision and an
 integration test using a real checkpoint.
+
+New source-pinned adapters for CPA, STATE, CellFlow, Squidiff and Scouter are
+described in the [Replogle execution record](docs/REPLOGLE_LOCAL_RUN.md), including
+unsupported-intervention policies and measured runtime limitations. Do not treat
+a passed smoke test as a completed baseline.
 
 ## Installation
 

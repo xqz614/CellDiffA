@@ -90,6 +90,20 @@ def test_feynman_kac_potential_telescopes_to_terminal_reward():
     assert torch.allclose(result["weights"], expected, atol=1e-6)
 
 
+@pytest.mark.parametrize("mode,selected", [("random", 0), ("best_of_n", 3)])
+def test_compute_matched_controls_preserve_independent_candidates(mode, selected):
+    config = make_config(alignment_mode=mode, ess_threshold=1.0)
+    result = SMCEngine(IdentitySampler(), MeanReward(), config).sample_with_alignment(
+        condition="A", condition_emb={}, num_genes=2
+    )
+    assert not any(result["resample_history"])
+    assert result["ancestor_history"] == [4] * 4
+    assert result["denoised_cell_steps"] == 4 * 3 * 4
+    torch.testing.assert_close(result["samples"], result["all_particles"][selected])
+    if mode == "random":
+        torch.testing.assert_close(result["weights"], torch.full((4,), 0.25))
+
+
 def test_condition_rows_follow_cells_across_forward_minibatches():
     class RecordingSampler(IdentitySampler):
         def __init__(self):
@@ -179,6 +193,40 @@ def test_anchor_prefers_training_derived_reference_distribution():
     reward = AnchorReward(shifts, bandwidth=1.0)
     scores = reward.compute(batches, "A+ctrl", timestep=0, ctrl_cells=ctrl_cells)
     assert scores[0] > scores[1]
+
+
+@pytest.mark.parametrize("device", ["cpu", "mps"])
+def test_anchor_is_permutation_invariant_and_uses_every_cell(device):
+    if device == "mps" and not torch.backends.mps.is_available():
+        pytest.skip("MPS not available")
+    reward = AnchorReward({"A": np.zeros(2, dtype=np.float32)}, bandwidth=1.0)
+    populations = torch.tensor(
+        [[[0.0, 1.0], [1.0, 0.0], [2.0, 3.0]], [[2.0, 2.0], [3.0, 1.0], [0.0, 4.0]]],
+        device=device,
+    )
+    controls = torch.tensor([[0.0, 1.0], [2.0, 0.0], [1.0, 4.0], [3.0, 2.0]], device=device)
+    original = reward.compute(populations, "A", 0, ctrl_cells=controls)
+    permuted = reward.compute(populations[:, [2, 0, 1]], "A", 0, ctrl_cells=controls[[3, 0, 2, 1]])
+    assert torch.allclose(original, permuted, atol=1e-6)
+    assert torch.all(original <= 0)
+    changed = populations.clone()
+    changed[:, -1] += 10
+    assert not torch.allclose(original, reward.compute(changed, "A", 0, ctrl_cells=controls))
+
+
+def test_anchor_single_cell_matches_exact_kernel_distance():
+    reward = AnchorReward({"A": np.array([1.0], dtype=np.float32)})
+    populations = torch.tensor([[[1.0]], [[3.0]]])
+    actual = reward.compute(populations, "A", 0, ctrl_cells=torch.zeros(1, 1))
+    expected = torch.tensor([0.0, -2.0 * (1.0 - np.exp(-2.0))], dtype=torch.float32)
+    assert torch.allclose(actual, expected, atol=1e-6)
+
+
+def test_anchor_identity_population_has_zero_distance():
+    controls = torch.tensor([[0.0, 1.0], [2.0, 4.0], [3.0, 2.0]])
+    reward = AnchorReward({"A": np.zeros(2, dtype=np.float32)})
+    score = reward.compute(controls[[2, 0, 1]].unsqueeze(0), "A", 0, ctrl_cells=controls)
+    assert torch.allclose(score, torch.zeros(1), atol=1e-6)
 
 
 def test_composite_reward_normalizes_objective_scales():

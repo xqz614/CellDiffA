@@ -13,13 +13,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-import anndata as ad
 import numpy as np
 import pandas as pd
 from scipy.sparse.linalg import svds
 
 from .perturbdiff_split import PerturbDiffSplit
-from .streaming import iter_h5ad_expression
+from .streaming import iter_h5ad_expression, read_h5ad_obs
 
 
 @dataclass(frozen=True)
@@ -92,11 +91,7 @@ def training_pseudobulk(
     chunk_size: int = 8192,
 ) -> tuple[np.ndarray, list[str], dict[str, int]]:
     """Return condition-balanced pseudobulk using official training rows only."""
-    backed = ad.read_h5ad(source, backed="r")
-    try:
-        obs = backed.obs.copy()
-    finally:
-        backed.file.close()
+    obs = read_h5ad_obs(source)
     required = {split.pert_col, split.context_col}
     missing = required - set(obs.columns)
     if missing:

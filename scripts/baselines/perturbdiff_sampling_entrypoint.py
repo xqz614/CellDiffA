@@ -45,6 +45,10 @@ def load_sampling_model_portable(cfg, logger, datamodule):
     import torch
     from src.models.lightning.lightning_module import PlModel
 
+    from celldiffa.benchmark.torch_compat import install_perturbdiff_mps_compat
+
+    install_perturbdiff_mps_compat(str(cfg.get("device", "cpu")))
+
     checkpoint = torch.load(
         cfg.model_checkpoint_path,
         map_location="cpu",
@@ -90,6 +94,10 @@ def main() -> None:
     # rawdata_diffusion_sampling imported the loader into its module namespace;
     # replacing that reference keeps the official model and sampling flow.
     upstream.load_sampling_model = load_sampling_model_portable
+    if os.environ.get("CELLDIFFA_RESUMABLE_SAMPLING") == "1":
+        from celldiffa.benchmark.released_sampling import generate_samples
+
+        upstream.generate_samples = generate_samples
 
     # Calling the decorated upstream main after importing it makes Hydra treat
     # ../../../configs as a Python package. PerturbDiff's configs directory is

@@ -132,6 +132,9 @@ class SMCConfig:
     seed: int = 42
     """Sampling seed. Reusing it across conditions enables paired comparisons."""
 
+    alignment_mode: str = "smc"
+    """'smc', terminal-only 'best_of_n', or unguided 'random'; same denoising budget."""
+
 
 # ============================================================
 # SMC Engine
@@ -248,6 +251,8 @@ class SMCEngine:
         # beta_k*r_k - beta_{k-1}*r_{k-1} telescopes to the desired terminal
         # reward when no resampling occurs and is the standard Feynman-Kac form.
         previous_log_potential = torch.zeros(N, device=self.device)
+        ancestors = torch.arange(N, device=self.device)
+        ancestor_history = []
 
         # Tracking
         ess_history = []
@@ -297,6 +302,10 @@ class SMCEngine:
             # Step 3: telescoping incremental potential.
             # ----------------------------------------------------------
             beta_t = beta_schedule[step_idx]
+            if self.config.alignment_mode == "random":
+                beta_t = 0.0
+            elif self.config.alignment_mode == "best_of_n":
+                beta_t = float(step_idx == num_steps - 1)
             current_log_potential = beta_t * rewards
             log_weights = (
                 log_weights + (current_log_potential - previous_log_potential) / self.config.alpha
@@ -316,15 +325,21 @@ class SMCEngine:
             did_resample = False
             # Do not resample at the terminal step: keeping the terminal weights
             # makes MAP and weighted-mean aggregation well-defined.
-            if step_idx < num_steps - 1 and ess < self.config.ess_threshold * N:
+            if (
+                self.config.alignment_mode == "smc"
+                and step_idx < num_steps - 1
+                and ess < self.config.ess_threshold * N
+            ):
                 indices = self.resampler.resample(weights, N)
                 x_prev = x_prev[indices]
                 prev_pred = prev_pred[indices]
                 current_log_potential = current_log_potential[indices]
+                ancestors = ancestors[indices]
                 log_weights = torch.zeros(N, device=self.device)  # Reset weights
                 did_resample = True
 
             resample_history.append(did_resample)
+            ancestor_history.append(int(torch.unique(ancestors).numel()))
 
             # Update particles
             x_t = x_prev
@@ -346,6 +361,8 @@ class SMCEngine:
             "resample_history": resample_history,
             "all_particles": x_t.cpu(),
             "cells_per_particle": M,
+            "ancestor_history": ancestor_history,
+            "denoised_cell_steps": N * M * num_steps,
         }
         if return_trajectory:
             result["trajectory"] = trajectory
@@ -373,6 +390,8 @@ class SMCEngine:
             raise ValueError("Unknown output_mode.")
         if self.config.output_mode == "top_k" and self.config.top_k < 1:
             raise ValueError("top_k must be positive.")
+        if self.config.alignment_mode not in {"smc", "best_of_n", "random"}:
+            raise ValueError("alignment_mode must be smc, best_of_n, or random.")
 
     def _build_tempering_schedule(self, num_steps: int) -> List[float]:
         """

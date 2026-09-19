@@ -26,8 +26,13 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--shard-root", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--variant", choices=["scratch", "finetuned"], required=True)
+    parser.add_argument("--evaluation-split", choices=["validation", "test"], default="test")
+    parser.add_argument("--reward-weights", nargs=3, type=float, default=[1.0, 1.0, 1.0])
+    parser.add_argument("--reward-normalization", choices=["zscore", "none"], default="zscore")
+    parser.add_argument("--alignment-mode", choices=["smc", "best_of_n", "random"], default="smc")
     parser.add_argument("--num-particles", type=int, default=16)
     parser.add_argument("--particle-batch-cells", type=int, default=128)
+    parser.add_argument("--native-blocks-per-population", type=int, default=1)
     parser.add_argument("--ess-threshold", type=float, default=0.5)
     parser.add_argument("--alpha", type=float, default=1.0)
     parser.add_argument("--top-de", type=int, default=20)
@@ -43,6 +48,8 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
         parser.error("worker-index must be in [0, num-workers).")
     if args.max_groups is not None and args.max_groups < 1:
         parser.error("max-groups must be positive.")
+    if args.native_blocks_per_population < 1:
+        parser.error("native-blocks-per-population must be positive.")
     return args, hydra_overrides
 
 
@@ -77,12 +84,6 @@ def main() -> None:
     import torch
     from hydra import compose, initialize_config_dir
     from omegaconf import OmegaConf
-    from pytorch_lightning.utilities import move_data_to_device
-    from src.apps.sampling.sampling_generation_helpers import (
-        build_gene_embedding_cache,
-        build_self_condition,
-        collect_batch_covariates,
-    )
     from src.apps.sampling.sampling_setup import (
         build_sampling_datamodule,
         populate_covariate_cfg,
@@ -98,6 +99,10 @@ def main() -> None:
         write_manifest,
     )
     from celldiffa.benchmark.perturbdiff_split import PerturbDiffSplit
+    from celldiffa.benchmark.population_blocks import (
+        BlockPopulationSampler,
+        iter_sampling_populations,
+    )
     from celldiffa.benchmark.replogle_priors import compute_replogle_training_priors
     from celldiffa.benchmark.replogle_shards import (
         assemble_replogle_shards,
@@ -132,7 +137,7 @@ def main() -> None:
     embedding_sha256 = sha256_file(args.perturbation_embeddings)
     split = PerturbDiffSplit.from_yaml(args.split_config, split_axis="context")
     real = ad.read_h5ad(args.real_test)
-    split.validate_real_test(real)
+    split.validate_reference(real, split_name=args.evaluation_split)
     if list(real.var_names.astype(str)) != selected_genes:
         raise ValueError("Selected genes and real-test H5AD have different order.")
     real_labels = real.obs[split.pert_col].astype(str)
@@ -148,6 +153,13 @@ def main() -> None:
     run_config = {
         "format_version": 1,
         "variant": args.variant,
+        "evaluation_split": args.evaluation_split,
+        "reference": str(Path(args.real_test).resolve()),
+        "device": str(cfg.device),
+        "torch_version": torch.__version__,
+        "reward_weights": args.reward_weights,
+        "reward_normalization": args.reward_normalization,
+        "alignment_mode": args.alignment_mode,
         "checkpoint": str(checkpoint_path),
         "checkpoint_size": checkpoint_path.stat().st_size,
         "checkpoint_mtime_ns": checkpoint_path.stat().st_mtime_ns,
@@ -159,10 +171,12 @@ def main() -> None:
         "upstream_revision": revision,
         "num_particles": args.num_particles,
         "particle_batch_cells": args.particle_batch_cells,
+        "native_blocks_per_population": args.native_blocks_per_population,
         "ess_threshold": args.ess_threshold,
         "alpha": args.alpha,
         "top_de": args.top_de,
         "anchor_bandwidth": args.anchor_bandwidth,
+        "anchor_estimator": "rbf_mmd_biased_all_pairs_v1",
         "prior_ridge": args.prior_ridge,
         "seed": args.seed,
         "normalize_counts": float(cfg.data.normalize_counts or 1.0),
@@ -198,6 +212,7 @@ def main() -> None:
             perturbation_embeddings=perturbation_embeddings,
             embedding_signature=embedding_sha256,
             ridge_penalty=args.prior_ridge,
+            evaluation_split=args.evaluation_split,
         )
         fcntl.flock(lock_handle, fcntl.LOCK_UN)
 
@@ -210,7 +225,7 @@ def main() -> None:
     model = model.to(device)
     model.eval()
     datamodule.setup_dataset()
-    dataloader = datamodule.val_dataloader()[1]
+    dataloader = datamodule.val_dataloader()[0 if args.evaluation_split == "validation" else 1]
     normalize_counts = float(cfg.data.normalize_counts or 1.0)
     scaled_shifts = {name: values / normalize_counts for name, values in priors.shifts.items()}
 
@@ -222,14 +237,20 @@ def main() -> None:
     start_time = time.time()
 
     with torch.no_grad():
-        for batch_data in dataloader:
-            batch_data = move_data_to_device(batch_data, device)
-            batch_data["batch_emb"] = model._encode_covariates(batch_data)
-            gene_emb = build_gene_embedding_cache(model, batch_data, device)
-            self_condition = build_self_condition(cfg, model, batch_data, gene_emb)
-            valid_mask = ~batch_data["is_padded_list"].bool()
-            covariates = collect_batch_covariates(batch_data, dataloader, datamodule, valid_mask)
-
+        for (
+            batch_data,
+            self_condition,
+            valid_mask,
+            covariates,
+            native_conditions,
+        ) in iter_sampling_populations(
+            dataloader,
+            model,
+            cfg,
+            device,
+            datamodule,
+            max_blocks=args.native_blocks_per_population,
+        ):
             for item_index, covariate in enumerate(covariates):
                 group_index = global_group
                 global_group += 1
@@ -285,21 +306,21 @@ def main() -> None:
                             scaled_shifts,
                             ctrl_mean,
                             selected_genes,
-                            weight=1.0,
+                            weight=args.reward_weights[0],
                             top_k=args.top_de,
                         ),
                         GeometricReward(
                             scaled_shifts,
                             ctrl_mean,
-                            weight=1.0,
+                            weight=args.reward_weights[1],
                         ),
                         AnchorReward(
                             scaled_shifts,
-                            weight=1.0,
+                            weight=args.reward_weights[2],
                             bandwidth=args.anchor_bandwidth,
                         ),
                     ],
-                    normalization="zscore",
+                    normalization=args.reward_normalization,
                 )
                 reward = ProjectedReward(
                     base_reward,
@@ -316,6 +337,13 @@ def main() -> None:
                     start_time=int(cfg.sampling.start_time),
                     clip_denoised=bool(cfg.sampling.clip_denoised),
                 )
+                if args.native_blocks_per_population > 1:
+                    sampler = BlockPopulationSampler(
+                        sampler,
+                        native_conditions[item_index],
+                        cells_per_block=int(cfg.data.use_cell_set),
+                        batch_cells=args.particle_batch_cells,
+                    )
                 smc_config = SMCConfig(
                     num_particles=args.num_particles,
                     cells_per_particle=int(controls.shape[0]),
@@ -326,8 +354,13 @@ def main() -> None:
                     guidance_strength=float(cfg.sampling.guidance_strength),
                     output_mode="map",
                     device=str(device),
-                    batch_size_per_step=args.particle_batch_cells,
+                    batch_size_per_step=(
+                        args.num_particles * len(controls)
+                        if args.native_blocks_per_population > 1
+                        else args.particle_batch_cells
+                    ),
                     seed=args.seed + group_index,
+                    alignment_mode=args.alignment_mode,
                 )
                 result = SMCEngine(sampler, reward, smc_config).sample_with_alignment(
                     perturbation,
@@ -345,6 +378,20 @@ def main() -> None:
                     group_index,
                     perturbation,
                     values,
+                )
+                write_manifest(
+                    path.with_suffix(".diagnostics.json"),
+                    {
+                        "group": group_index,
+                        "perturbation": perturbation,
+                        "valid_cells": len(labels),
+                        "padded_population_cells": int(controls.shape[0]),
+                        "ess": result["ess_history"],
+                        "resampled": result["resample_history"],
+                        "final_weights": result["weights"].tolist(),
+                        "distinct_initial_ancestors": result["ancestor_history"],
+                        "denoised_cell_steps": result["denoised_cell_steps"],
+                    },
                 )
                 processed_now += 1
                 logger.info(
@@ -381,6 +428,7 @@ def main() -> None:
     )
     manifest = {
         "method": "CellDiffA",
+        "alignment_mode": args.alignment_mode,
         "dataset": "Replogle-Nadig",
         "base_model": f"PerturbDiff {args.variant} released checkpoint",
         "upstream_revision": PERTURBDIFF_REVISION,
@@ -396,7 +444,11 @@ def main() -> None:
         "evaluation_genes": len(selected_genes),
         "normalization_scale": normalize_counts,
         "num_particles": args.num_particles,
-        "cells_per_particle": int(cfg.data.use_cell_set),
+        "native_cells_per_block": int(cfg.data.use_cell_set),
+        "maximum_padded_cells_per_particle": (
+            int(cfg.data.use_cell_set) * args.native_blocks_per_population
+        ),
+        "native_blocks_per_population": args.native_blocks_per_population,
         "ess_threshold": args.ess_threshold,
         "alpha": args.alpha,
         "top_de": args.top_de,

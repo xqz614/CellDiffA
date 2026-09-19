@@ -16,6 +16,18 @@ dataset="$1"
 variant="$2"
 output_dir="$3"
 gpu="${4:-0}"
+device="${CELLDIFFA_DEVICE:-cuda:0}"
+runtime_overrides=("device=$device")
+if [[ "$device" == "mps" || "$device" == "cpu" ]]; then
+  runtime_overrides=(
+    "trainer.accelerator=$device" "trainer.devices=1"
+    "data.num_workers=0" "data.prefetch_factor=null"
+    "data.persistent_workers=false" "data.pin_memory=false"
+  )
+fi
+if [[ -n "${CELLDIFFA_CONTROL_REFERENCE:-}" ]]; then
+  runtime_overrides+=("path.replogle_ctrl_h5ad=$CELLDIFFA_CONTROL_REFERENCE")
+fi
 perturbdiff_root="${5:-external/PerturbDiff}"
 data_root="${CELLDIFFA_DATA_ROOT:-/data/users/jchengak/DiffA/CellDiffA/data}"
 perturb_data_root="$data_root/PerturbDiff_data"
@@ -123,19 +135,19 @@ common=(
   "data.prefetch_factor=16"
   "data.use_cell_set=$cell_set"
   "data.keep_control_cell=false"
-  "optimization.micro_batch_size=$micro_batch"
+  "optimization.micro_batch_size=${CELLDIFFA_MICRO_BATCH_SIZE:-$micro_batch}"
   "model.hidden_num=[$model_input_dim,512]"
   "model.input_dim=$model_input_dim"
   "data.pad_length=$pad_length"
   "data.embed_key=$embed_key"
   "trainer.devices=[0]"
   "trainer.use_distributed_sampler=false"
-  "device=cuda:0"
+  "device=$device"
   "path.tmp_dir=$perturb_data_root"
   "path.diffusion.save_dir=$output_dir"
   "path.wandb.logging_dir=$output_dir/wandb"
   "sampling.output_dir=$output_dir"
-  "sampling.num_sampled_batches=null"
+  "sampling.num_sampled_batches=${CELLDIFFA_MAX_SAMPLED_BATCHES:-null}"
   "sampling.use_ddim=true"
   "sampling.start_time=100"
   "sampling.eta=0.0"
@@ -155,7 +167,7 @@ common=(
 )
 
 if [[ "$dataset" == "replogle" && "$variant" == "finetuned" ]]; then
-  python "$entrypoint" "${common[@]}" "${variant_overrides[@]}" "${extra_covariates[@]}"
+  python "$entrypoint" "${common[@]}" "${variant_overrides[@]}" "${extra_covariates[@]}" "${runtime_overrides[@]}"
 else
-  python "$entrypoint" "${common[@]}" "${extra_covariates[@]}"
+  python "$entrypoint" "${common[@]}" "${extra_covariates[@]}" "${runtime_overrides[@]}"
 fi

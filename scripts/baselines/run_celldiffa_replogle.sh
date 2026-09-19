@@ -15,6 +15,15 @@ fi
 variant="$1"
 output_dir="$2"
 gpu="${3:-0}"
+device="${CELLDIFFA_DEVICE:-cuda:0}"
+runtime_overrides=("device=$device")
+if [[ "$device" == "mps" || "$device" == "cpu" ]]; then
+  runtime_overrides=(
+    "trainer.accelerator=$device" "trainer.devices=1"
+    "data.num_workers=0" "data.prefetch_factor=null"
+    "data.persistent_workers=false" "data.pin_memory=false"
+  )
+fi
 worker_index="${4:-0}"
 num_workers="${5:-1}"
 max_groups="${6:-all}"
@@ -32,7 +41,12 @@ checkpoint_root="$data_root/checkpoints/PerturbDiff_release_ckpt"
 source_h5ad="$perturb_data_root/finetune_data/nadig_processed_data/replogle.h5ad"
 selected_genes="$perturb_data_root/selected_genes/replogle_real_selected_genes.pkl"
 perturbation_embeddings="$perturb_data_root/gene_names/replogle_gene_emb_dict_perturbation_emb_dict.pkl"
-real_test="${CELLDIFFA_REAL_TEST:-$repo_root/results/replogle/reference/real.h5ad}"
+evaluation_split="${CELLDIFFA_EVALUATION_SPLIT:-test}"
+reference_filename="real.h5ad"
+if [[ "$evaluation_split" == "validation" ]]; then
+  reference_filename="validation.h5ad"
+fi
+real_test="${CELLDIFFA_REAL_TEST:-$repo_root/results/replogle/reference/$reference_filename}"
 split_config="$perturbdiff_root_abs/configs/data/perturb_data/replogle.yaml"
 entrypoint="$repo_root/scripts/baselines/run_celldiffa_replogle.py"
 model_input_dim=2000
@@ -101,10 +115,20 @@ celldiffa_args=(
   "--shard-root" "$output_dir/shards"
   "--output" "$output_dir/celldiffa_${variant}.h5ad"
   "--variant" "$variant"
+  "--evaluation-split" "$evaluation_split"
+  "--alpha" "${CELLDIFFA_ALPHA:-1.0}"
+  "--alignment-mode" "${CELLDIFFA_ALIGNMENT_MODE:-smc}"
+  "--reward-normalization" "${CELLDIFFA_REWARD_NORMALIZATION:-zscore}"
+  "--ess-threshold" "${CELLDIFFA_ESS_THRESHOLD:-0.5}"
+  "--seed" "${CELLDIFFA_SEED:-42}"
+  "--prior-ridge" "${CELLDIFFA_PRIOR_RIDGE:-1.0}"
+  "--anchor-bandwidth" "${CELLDIFFA_ANCHOR_BANDWIDTH:-1.0}"
+  "--reward-weights" "${CELLDIFFA_SIGNATURE_WEIGHT:-1.0}" "${CELLDIFFA_DIRECTION_WEIGHT:-1.0}" "${CELLDIFFA_ANCHOR_WEIGHT:-1.0}"
   "--worker-index" "$worker_index"
   "--num-workers" "$num_workers"
   "--num-particles" "${CELLDIFFA_NUM_PARTICLES:-16}"
   "--particle-batch-cells" "${CELLDIFFA_PARTICLE_BATCH_CELLS:-128}"
+  "--native-blocks-per-population" "${CELLDIFFA_NATIVE_BLOCKS_PER_POPULATION:-1}"
 )
 if [[ "$max_groups" != "all" ]]; then
   celldiffa_args+=("--max-groups" "$max_groups")
@@ -127,7 +151,7 @@ hydra_args=(
   "data.embed_key=$embed_key"
   "trainer.devices=[0]"
   "trainer.use_distributed_sampler=false"
-  "device=cuda:0"
+  "device=$device"
   "path.tmp_dir=$perturb_data_root"
   "path.diffusion.save_dir=$worker_output_dir"
   "path.wandb.logging_dir=$worker_output_dir/wandb"
@@ -156,9 +180,11 @@ if [[ "$variant" == "finetuned" ]]; then
   python "$entrypoint" \
     "${celldiffa_args[@]}" \
     "${hydra_args[@]}" \
-    "${variant_overrides[@]}"
+    "${variant_overrides[@]}" \
+    "${runtime_overrides[@]}"
 else
   python "$entrypoint" \
     "${celldiffa_args[@]}" \
-    "${hydra_args[@]}"
+    "${hydra_args[@]}" \
+    "${runtime_overrides[@]}"
 fi

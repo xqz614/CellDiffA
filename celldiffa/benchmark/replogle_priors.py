@@ -8,11 +8,15 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-import anndata as ad
 import numpy as np
 
 from .perturbdiff_split import PerturbDiffSplit
-from .streaming import iter_h5ad_expression
+from .streaming import (
+    h5ad_expression_shape,
+    iter_h5ad_expression,
+    read_h5ad_obs,
+    read_h5ad_var,
+)
 
 
 @dataclass(frozen=True)
@@ -40,9 +44,11 @@ def _metadata(
     target_perturbations: list[str],
     embedding_signature: str | None,
     ridge_penalty: float,
+    evaluation_split: str,
 ) -> dict:
     return {
-        "format_version": 2,
+        "format_version": 3,
+        "evaluation_split": evaluation_split,
         "source": str(source),
         "source_signature": _source_signature(source),
         "split_path": str(split_path),
@@ -141,8 +147,9 @@ def compute_replogle_training_priors(
     perturbation_embeddings: Mapping[str, np.ndarray] | None = None,
     embedding_signature: str | None = None,
     ridge_penalty: float = 1.0,
+    evaluation_split: str = "test",
 ) -> ReplogleTrainingPriors:
-    """Compute test-perturbation priors without reading held-out responses.
+    """Compute validation/test priors without using any held-out responses.
 
     Each training response is centered by the control mean from its own cell
     line before pooling. Controls in the held-out context are allowed because
@@ -158,16 +165,21 @@ def compute_replogle_training_priors(
     if perturbation_embeddings is not None and not embedding_signature:
         raise ValueError("embedding_signature is required when embeddings are supplied.")
     split = PerturbDiffSplit.from_yaml(split_path, split_axis="context")
+    if evaluation_split not in {"validation", "test"}:
+        raise ValueError("evaluation_split must be validation or test.")
+    allowed = split.validation_perts if evaluation_split == "validation" else split.test_perts
     target_perts = sorted(
-        split.test_perts
+        allowed
         if target_perturbations is None
         else {str(value) for value in target_perturbations}
     )
-    unexpected = sorted(set(target_perts) - set(split.test_perts))
+    unexpected = sorted(set(target_perts) - set(allowed))
     if unexpected:
-        raise ValueError(f"Requested priors outside the official test split: {unexpected}.")
+        raise ValueError(
+            f"Requested priors outside the official {evaluation_split} split: {unexpected}."
+        )
     if not target_perts:
-        raise ValueError("At least one test perturbation is required.")
+        raise ValueError("At least one target perturbation is required.")
     expected = _metadata(
         source,
         split_path,
@@ -177,6 +189,7 @@ def compute_replogle_training_priors(
         target_perts,
         embedding_signature,
         ridge_penalty,
+        evaluation_split,
     )
     cache = Path(cache_path).resolve() if cache_path is not None else None
     if cache is not None:
@@ -184,18 +197,11 @@ def compute_replogle_training_priors(
         if loaded is not None:
             return loaded
 
-    backed = ad.read_h5ad(source, backed="r")
-    try:
-        obs = backed.obs[[split.pert_col, split.context_col]].copy()
-        if expression_key == "X" and list(backed.var_names.astype(str)) != genes:
-            raise ValueError("X gene order does not match the requested prior genes.")
-        if expression_key != "X" and backed.obsm[expression_key].shape[1] != len(genes):
-            raise ValueError(
-                f"{expression_key} has {backed.obsm[expression_key].shape[1]} columns; "
-                f"expected {len(genes)}."
-            )
-    finally:
-        backed.file.close()
+    obs = read_h5ad_obs(source)[[split.pert_col, split.context_col]].copy()
+    if expression_key == "X" and list(read_h5ad_var(source).index.astype(str)) != genes:
+        raise ValueError("X gene order does not match the requested prior genes.")
+    if h5ad_expression_shape(source, expression_key)[1] != len(genes):
+        raise ValueError(f"{expression_key} must have {len(genes)} columns.")
 
     masks = split.masks(obs, split_axis="context")
     labels = obs[split.pert_col].astype(str).to_numpy()

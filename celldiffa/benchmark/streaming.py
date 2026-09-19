@@ -9,6 +9,29 @@ import h5py
 import numpy as np
 from scipy import sparse
 
+try:
+    from anndata.io import read_elem
+except ImportError:
+    # The pinned CPA runtime requires AnnData 0.9, before the public io module.
+    from anndata._io.specs import read_elem
+
+
+def read_h5ad_obs(path: str | Path):
+    """Read only metadata; AnnData's backed reader can still materialize obsm."""
+    with h5py.File(path, "r") as handle:
+        return read_elem(handle["obs"])
+
+
+def read_h5ad_var(path: str | Path):
+    with h5py.File(path, "r") as handle:
+        return read_elem(handle["var"])
+
+
+def h5ad_expression_shape(path: str | Path, expression_key: str = "X_hvg"):
+    with h5py.File(path, "r") as handle:
+        obj = handle["X"] if expression_key == "X" else handle["obsm"][expression_key]
+        return _shape(obj)
+
 
 def _encoding(obj) -> str | None:
     value = obj.attrs.get("encoding-type")

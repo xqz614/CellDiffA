@@ -97,6 +97,15 @@ class PerturbDiffSplit:
 
     def validate_real_test(self, real, *, require_single_holdout: bool = True) -> None:
         """Reject a real-test H5AD that does not match this released split."""
+        self.validate_reference(real, require_single_holdout=require_single_holdout)
+
+    def validate_reference(
+        self, real, *, split_name: str = "test", require_single_holdout: bool = True
+    ) -> None:
+        """Validate validation and test references without interchanging them."""
+        if split_name not in {"validation", "test"}:
+            raise ValueError("split_name must be validation or test.")
+        expected_perts = self.test_perts if split_name == "test" else self.validation_perts
         required = {self.pert_col, self.context_col}
         missing = required - set(real.obs.columns)
         if missing:
@@ -104,10 +113,10 @@ class PerturbDiffSplit:
         labels = real.obs[self.pert_col].astype(str)
         treated = labels != self.control_pert
         observed_perts = set(labels[treated])
-        unexpected = observed_perts - set(self.test_perts)
+        unexpected = observed_perts - set(expected_perts)
         if unexpected:
             raise ValueError(
-                "Real test contains perturbations outside the PerturbDiff test split: "
+                f"Reference contains perturbations outside the PerturbDiff {split_name} split: "
                 f"{sorted(unexpected)[:10]}"
             )
         if not observed_perts:

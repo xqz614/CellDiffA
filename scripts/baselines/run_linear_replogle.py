@@ -18,6 +18,7 @@ from celldiffa.benchmark.artifacts import (
 from celldiffa.benchmark.contracts import build_prediction_anndata
 from celldiffa.benchmark.linear_replogle import fit_official_linear, training_pseudobulk
 from celldiffa.benchmark.perturbdiff_split import PerturbDiffSplit
+from celldiffa.benchmark.streaming import read_h5ad_var
 
 OFFICIAL_REPOSITORY = "https://github.com/const-ae/linear_perturbation_prediction-Paper"
 OFFICIAL_REVISION = "bfa6eeea2bd145a1af2ec0127a2e808cc38456a9"
@@ -98,19 +99,15 @@ def main() -> None:
     if list(real.var_names.astype(str)) != selected_genes:
         raise ValueError("Selected-gene pickle order differs from the real-test H5AD.")
 
-    source_backed = ad.read_h5ad(source, backed="r")
-    try:
-        if args.expression_key == "X":
-            fit_genes = list(source_backed.var_names.astype(str))
-        elif args.expression_key == "X_hvg":
-            fit_genes = selected_genes
-        else:
-            raise ValueError(
-                "Linear currently supports expression-key X (full fitting space) or "
-                "X_hvg (evaluation space)."
-            )
-    finally:
-        source_backed.file.close()
+    if args.expression_key == "X":
+        fit_genes = list(read_h5ad_var(source).index.astype(str))
+    elif args.expression_key == "X_hvg":
+        fit_genes = selected_genes
+    else:
+        raise ValueError(
+            "Linear currently supports expression-key X (full fitting space) or "
+            "X_hvg (evaluation space)."
+        )
     labels = real.obs[split.pert_col].astype(str).to_numpy()
     test_perts = sorted(set(labels) - {split.control_pert})
     embedding_names = (

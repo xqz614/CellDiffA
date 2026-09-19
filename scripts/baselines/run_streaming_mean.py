@@ -11,7 +11,7 @@ import numpy as np
 
 from celldiffa.benchmark.contracts import build_prediction_anndata
 from celldiffa.benchmark.perturbdiff_split import PerturbDiffSplit
-from celldiffa.benchmark.streaming import iter_h5ad_expression
+from celldiffa.benchmark.streaming import iter_h5ad_expression, read_h5ad_obs
 
 
 def _update(store, keys, values):
@@ -63,8 +63,7 @@ def main() -> None:
     }
     n_genes = None
     for path in _source_files(Path(args.source)):
-        backed = ad.read_h5ad(path, backed="r")
-        obs = backed.obs
+        obs = read_h5ad_obs(path)
         required = {pert_col, context_col, batch_col} - {None}
         missing = required - set(obs.columns)
         if missing:
@@ -99,7 +98,6 @@ def main() -> None:
                 np.repeat("overall", int(local_treated.sum())),
                 values[local_treated],
             )
-        backed.file.close()
 
     real = ad.read_h5ad(args.real_test)
     if n_genes != real.n_vars:

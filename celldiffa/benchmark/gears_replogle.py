@@ -10,7 +10,7 @@ import pandas as pd
 from scipy import sparse
 
 from .perturbdiff_split import PerturbDiffSplit
-from .streaming import iter_h5ad_expression
+from .streaming import iter_h5ad_expression, read_h5ad_obs
 
 
 def to_gears_condition(label: str, *, control_pert: str) -> str:
@@ -56,11 +56,7 @@ def materialize_training_anndata(
 ) -> tuple[ad.AnnData, dict[str, int]]:
     """Materialize only official training rows; test expression is never read."""
     source = Path(source)
-    backed = ad.read_h5ad(source, backed="r")
-    try:
-        obs = backed.obs.copy()
-    finally:
-        backed.file.close()
+    obs = read_h5ad_obs(source)
     required = {split.pert_col, split.context_col}
     missing = required - set(obs.columns)
     if missing:

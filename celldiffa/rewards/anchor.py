@@ -15,7 +15,12 @@ from .base import BaseReward
 
 
 class AnchorReward(BaseReward):
-    """Negative linear-time RBF MMD to a training-derived reference batch."""
+    """Negative squared RBF MMD between two empirical cell distributions.
+
+    The biased V-statistic includes every cell and is invariant to the ordering
+    of either population. Gram matrices use O(particles * cells**2) memory,
+    without materializing pairwise differences along the gene dimension.
+    """
 
     def __init__(
         self,
@@ -44,6 +49,8 @@ class AnchorReward(BaseReward):
             )
 
         n_particles, n_cells, n_genes = x_pred.shape
+        if n_cells == 0 or n_genes == 0:
+            raise ValueError("Candidate populations must contain cells and genes.")
         shift = self._resolve_shift(condition, x_pred.device)
         if shift is None or ctrl_cells is None:
             return torch.zeros(n_particles, device=x_pred.device)
@@ -52,27 +59,24 @@ class AnchorReward(BaseReward):
         if ctrl_cells.ndim != 2 or ctrl_cells.shape[1] != n_genes:
             raise ValueError("ctrl_cells must have shape (cells, genes).")
 
-        # Match the particle batch size without introducing test data.
-        if ctrl_cells.shape[0] < n_cells:
-            repeats = (n_cells + ctrl_cells.shape[0] - 1) // ctrl_cells.shape[0]
-            ctrl_cells = ctrl_cells.repeat(repeats, 1)
-        reference = ctrl_cells[:n_cells] + shift.unsqueeze(0)
-
-        # A linear-time MMD estimator avoids O(N*M^2*G) memory. Pair adjacent
-        # cells; for odd M, omit the last cell.
-        paired = n_cells - (n_cells % 2)
-        if paired < 2:
-            return torch.zeros(n_particles, device=x_pred.device)
-        x0, x1 = x_pred[:, :paired:2], x_pred[:, 1:paired:2]
-        y0 = reference[:paired:2].unsqueeze(0).expand(n_particles, -1, -1)
-        y1 = reference[1:paired:2].unsqueeze(0).expand(n_particles, -1, -1)
+        if ctrl_cells.shape[0] == 0:
+            raise ValueError("The control population cannot be empty.")
+        reference = (ctrl_cells + shift.to(x_pred.dtype).unsqueeze(0)).unsqueeze(0)
 
         def kernel(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-            mean_sq_distance = (a - b).square().mean(dim=-1)
-            return torch.exp(-mean_sq_distance / (2.0 * self.bandwidth**2))
+            squared_distance = (
+                a.square().sum(dim=-1, keepdim=True)
+                + b.square().sum(dim=-1).unsqueeze(-2)
+                - 2.0 * torch.matmul(a, b.transpose(-1, -2))
+            ).clamp_min(0)
+            return torch.exp(-squared_distance / (2.0 * n_genes * self.bandwidth**2))
 
-        mmd = (kernel(x0, x1) + kernel(y0, y1) - kernel(x0, y1) - kernel(x1, y0)).mean(dim=1)
-        return -mmd
+        mmd_squared = (
+            kernel(x_pred, x_pred).mean(dim=(-2, -1))
+            + kernel(reference, reference).mean(dim=(-2, -1))
+            - 2.0 * kernel(x_pred, reference).mean(dim=(-2, -1))
+        )
+        return -mmd_squared.clamp_min(0)
 
     def _resolve_shift(self, condition: str, device: torch.device) -> Optional[torch.Tensor]:
         if condition in self._shift_cache:

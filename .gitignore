@@ -10,6 +10,13 @@ build/
 data/raw/
 data/processed/
 data/splits/
+data/PerturbDiff_data/
+data/checkpoints/
+data/.downloads/
+data/.cache/
+data/download_manifest.json
+data/gears_assets/
+outputs/
 
 # Checkpoints
 checkpoints/

@@ -11,7 +11,8 @@ from celldiffa.benchmark.replogle_shards import (
 )
 
 
-def test_replogle_priors_exclude_heldout_expression_and_center_context(tmp_path):
+@pytest.mark.parametrize("evaluation_split", ["test", "validation"])
+def test_replogle_priors_exclude_heldout_expression_and_center_context(tmp_path, evaluation_split):
     obs = pd.DataFrame(
         {
             "gene": ["non-targeting", "P", "non-targeting", "P"],
@@ -33,21 +34,44 @@ def test_replogle_priors_exclude_heldout_expression_and_center_context(tmp_path)
                 "control_pert": "non-targeting",
                 "cell_line_key": "cell_line",
                 "holdout_celltype": ["B"],
-                "holdout_pert": {"validation": [], "test": ["P"]},
+                "holdout_pert": {
+                    "validation": ["P"] if evaluation_split == "validation" else [],
+                    "test": ["P"] if evaluation_split == "test" else [],
+                },
             }
         )
     )
     cache = tmp_path / "priors.npz"
     priors = compute_replogle_training_priors(
-        source, split_path, ["g0", "g1"], cache_path=cache, top_k=1, chunk_size=2
+        source,
+        split_path,
+        ["g0", "g1"],
+        cache_path=cache,
+        top_k=1,
+        chunk_size=2,
+        evaluation_split=evaluation_split,
     )
     np.testing.assert_allclose(priors.shifts["P"], [2, 2])
     assert priors.counts == {"P": 1}
     assert cache.exists()
     cached = compute_replogle_training_priors(
-        source, split_path, ["g0", "g1"], cache_path=cache, top_k=1
+        source,
+        split_path,
+        ["g0", "g1"],
+        cache_path=cache,
+        top_k=1,
+        evaluation_split=evaluation_split,
     )
     np.testing.assert_array_equal(cached.shifts["P"], priors.shifts["P"])
+    other = "validation" if evaluation_split == "test" else "test"
+    with pytest.raises(ValueError, match="outside the official"):
+        compute_replogle_training_priors(
+            source,
+            split_path,
+            ["g0", "g1"],
+            target_perturbations=["P"],
+            evaluation_split=other,
+        )
 
 
 def test_unobserved_test_perturbation_uses_training_only_embedding_ridge(tmp_path):
