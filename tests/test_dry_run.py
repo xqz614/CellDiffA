@@ -104,6 +104,24 @@ def test_compute_matched_controls_preserve_independent_candidates(mode, selected
         torch.testing.assert_close(result["weights"], torch.full((4,), 0.25))
 
 
+def test_selection_modes_use_the_same_actual_denoising_work():
+    class CountingSampler(IdentitySampler):
+        def __init__(self):
+            super().__init__()
+            self.cell_steps = 0
+
+        def denoise_step(self, x_t, t, condition, prev_pred=None):
+            self.cell_steps += x_t.numel() // x_t.shape[-1]
+            return super().denoise_step(x_t, t, condition, prev_pred)
+
+    for mode in ["smc", "best_of_n", "random"]:
+        sampler = CountingSampler()
+        result = SMCEngine(
+            sampler, MeanReward(), make_config(alignment_mode=mode, ess_threshold=1.0)
+        ).sample_with_alignment(condition="A", condition_emb={}, num_genes=2)
+        assert sampler.cell_steps == result["denoised_cell_steps"] == 4 * 3 * 4
+
+
 def test_condition_rows_follow_cells_across_forward_minibatches():
     class RecordingSampler(IdentitySampler):
         def __init__(self):

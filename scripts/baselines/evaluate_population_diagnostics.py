@@ -26,7 +26,8 @@ def dense(values):
 
 
 def effective_rank(values):
-    centered = np.asarray(values, dtype=np.float64) - values.mean(axis=0)
+    values = np.asarray(values, dtype=np.float64)
+    centered = values - values.mean(axis=0)
     eigenvalues = np.linalg.eigvalsh(centered.T @ centered)
     eigenvalues = np.maximum(eigenvalues, 0)
     if eigenvalues.sum() < 1e-12:
@@ -100,6 +101,8 @@ def main():
     write_manifest(
         args.outdir / "diagnostics_manifest.json",
         dict(
+            diagnostic_version=2,
+            implementation_sha256=sha256_file(__file__),
             real_sha256=sha256_file(args.real),
             prediction_sha256=sha256_file(args.pred),
             base_sha256=sha256_file(args.base) if args.base else None,

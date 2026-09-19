@@ -1,6 +1,6 @@
 # Replogle local experiment record
 
-Updated 2026-09-19, 17:25 China time. This is an execution record, not a claim
+Updated 2026-09-19, 19:28 China time. This is an execution record, not a claim
 that the full baseline suite or AdaCell experiments have finished. A baseline is
 complete only after a full prediction artifact passes the shared contract and
 the full published evaluation finishes. Unit tests and smoke runs do not count.
@@ -35,12 +35,12 @@ the full published evaluation finishes. Unit tests and smoke runs do not count.
 | PerturbDiff Finetuned test | Queued behind Scratch in the running job |
 | PerturbDiff Scratch validation | **Complete**, all 60 validation perturbations evaluated |
 | GEARS | Native training/prediction smoke passed; full training running |
-| CPA | Full native CPU training running, 13-epoch cap; not complete |
+| CPA | **Complete**, all 13 epochs, full predictions and all 14 metrics for 380 test conditions |
 | STATE / CellFlow / Squidiff | Native training/prediction smoke passed; full runs pending |
 | AdaCell Scratch validation | First full validation run running; no complete AdaCell result yet |
 | AdaCell Finetuned / test runs | Await validation selection and locked settings |
-| Compute-matched controls / ablations | Implemented and unit tested; full experiments pending |
-| Independent population diagnostics | Implemented and run for Scouter; remaining experiments pending |
+| Compute-matched controls / ablations | Nine validation cases prepared per backbone; budget checks tested; full experiments pending |
+| Independent population diagnostics | **Complete** for the seven finished test baselines; no complete AdaCell diagnostic comparison yet |
 
 The source has **643,413 cells × 6,642 genes**, with a 22.30 GB uncompressed
 matrix. Training contains 611,710 rows. Validation contains 4,825 responses
@@ -92,7 +92,7 @@ is a smoke run and never produces evaluator-ready full results.
   pairing, loss, optimizer, schedule and early-stopping rule. The loop saves
   cloned best checkpoints rather than retaining a mutable state dictionary.
   Held-out expression is never used as the prediction input.
-- No full local result was available at the initial checkpoint; six test baselines
+- No full local result was available at the initial checkpoint; seven test baselines
   are now fully evaluated, as listed above.
 - HF HTTP/2 interrupted a large transfer. Downloader now uses HTTP/1.1 and
   external retries that retain the current partial-file resume offset.
@@ -193,3 +193,25 @@ backbone evaluations, validation-only steering selection for both backbones,
 locked full test runs, compute-matched controls, reward ablations, independent
 diagnostics, multiple seeds and biological case studies. No SOTA or preserved-
 diversity claim is established yet.
+
+## Parallel work completed at 19:28
+
+- CPA's native CPU run finished all 13 epochs and wrote a 31,854 by 2,000
+  prediction artifact, including copied controls. Shared Cell-Eval 0.6.6
+  evaluation completed with 380 finite entries in every paper metric.
+- CPA macro means: R2 0.963596, PDCorr 0.071066, MSE 0.011168, and PDS cos
+  0.498927. These are local matched-protocol results, not the published table.
+- All seven baselines have independently computed version-2 population
+  diagnostics, with identical references, projection seed and condition coverage.
+- New validation plans cover same-budget unselected candidates, terminal
+  best-of-16, three temperatures, individual reward ablations and removal of
+  candidate-wise standardization. Plans have not launched additional model jobs.
+- Actual sampling-budget audit tooling rejects incompatible settings and refuses
+  to call partial group overlap a complete matched-budget comparison.
+- Tests: 85 passed in the CPU-focused suite; 5 MPS-specific tests were excluded
+  from this pass to avoid competing with active model jobs. New targeted tests
+  include actual denoising work across all three selection modes.
+
+See [steering controls and diagnostic interpretation](REPLOGLE_STEERING_CONTROLS.md).
+Generate the current verified report with
+`python scripts/baselines/summarize_replogle_completed.py --outdir results/replogle/parallel_analysis`.

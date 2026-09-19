@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "evaluation_split": "validation",
+  "selection": {
+    "eligible_cases": ["adacell_alpha05", "adacell_alpha1", "adacell_alpha2"],
+    "metric": "PDS_cos",
+    "statistic": "mean",
+    "direction": "maximize",
+    "tie_tolerance": 0.000001,
+    "tie_break": "larger alpha, corresponding to weaker steering",
+    "policy": "Select only after all eligible validation cases have complete predictions and 14 metrics for every condition. Inspect independent diversity diagnostics and report tradeoffs; no preservation guarantee is assumed. Freeze the chosen configuration before test inference. Test scores never select parameters."
+  },
+  "shared": {
+    "num_particles": 16,
+    "native_blocks_per_population": 16,
+    "particle_batch_cells": 1024,
+    "seed": 42,
+    "alpha": 1.0,
+    "alignment_mode": "smc",
+    "reward_normalization": "zscore",
+    "ess_threshold": 0.5,
+    "signature_weight": 1.0,
+    "direction_weight": 1.0,
+    "anchor_weight": 1.0,
+    "anchor_bandwidth": 1.0,
+    "prior_ridge": 1.0
+  },
+  "cases": [
+    {"id": "adacell_alpha1", "role": "primary", "overrides": {}},
+    {"id": "unselected16", "role": "control", "overrides": {"alignment_mode": "random"}},
+    {"id": "best_of_16", "role": "control", "overrides": {"alignment_mode": "best_of_n"}},
+    {"id": "adacell_alpha05", "role": "temperature", "overrides": {"alpha": 0.5}},
+    {"id": "adacell_alpha2", "role": "temperature", "overrides": {"alpha": 2.0}},
+    {"id": "without_signature", "role": "ablation", "overrides": {"signature_weight": 0.0}},
+    {"id": "without_direction", "role": "ablation", "overrides": {"direction_weight": 0.0}},
+    {"id": "without_anchor", "role": "ablation", "overrides": {"anchor_weight": 0.0}},
+    {"id": "without_zscore", "role": "diagnostic", "overrides": {"reward_normalization": "none"}}
+  ]
+}

@@ -26,3 +26,9 @@ def test_descriptive_distribution_checks_detect_collapse_and_permutations():
     assert effective_rank(np.repeat(x[:1], len(x), axis=0)) == 0
     assert sliced_wasserstein(x, x[::-1]) == 0
     assert sliced_wasserstein(x, x + 1) == pytest.approx(1)
+
+
+def test_effective_rank_constant_float32_population_has_no_spurious_rank():
+    # Accumulating a float32 mean can introduce an artificial nonzero direction.
+    values = np.repeat(np.full((1, 64), 0.1, dtype=np.float32), 200, axis=0)
+    assert effective_rank(values) == 0.0
