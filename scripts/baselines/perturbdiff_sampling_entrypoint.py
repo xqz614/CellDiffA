@@ -1,10 +1,12 @@
 #!/usr/bin/env python
-"""Run PerturbDiff sampling with portable checkpoint asset paths.
+"""Run PerturbDiff sampling with portable paths and checkpoint category IDs.
 
 Released PerturbDiff checkpoints retain absolute covariate-asset paths from
 the authors' cluster. The upstream sampling loader reuses those paths instead
-of the runtime Hydra values. This wrapper patches only those path fields in
-memory, then delegates the rest of sampling to the pinned upstream entrypoint.
+of the runtime Hydra values. A dataset subset also rebuilds local category IDs,
+which must not index the checkpoint's global embedding tables. This wrapper
+relocates assets and restores the saved category vocabulary before datasets are
+built, without changing weights, data splits, or the native sampler.
 """
 
 from __future__ import annotations
@@ -14,6 +16,8 @@ import os
 import sys
 from pathlib import Path
 from typing import Any
+
+from celldiffa.benchmark.perturbdiff_covariates import align_checkpoint_covariates
 
 COVARIATE_PATH_KEYS = (
     "celltype_embedding_path",
@@ -62,6 +66,9 @@ def load_sampling_model_portable(cfg, logger, datamodule):
     model_cfg = hparams.get("model_cfg", cfg.model)
     optimizer_cfg = hparams.get("optimizer_cfg", cfg.optimization)
     del checkpoint
+
+    report = align_checkpoint_covariates(cfg, datamodule, covariate_cfg)
+    logger.info("Checkpoint category alignment: %s", report)
 
     return PlModel.load_from_checkpoint(
         cfg.model_checkpoint_path,

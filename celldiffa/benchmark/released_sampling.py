@@ -19,6 +19,7 @@ from omegaconf import OmegaConf
 
 from .artifacts import write_manifest
 from .contracts import build_prediction_anndata
+from .perturbdiff_covariates import validate_checkpoint_covariates
 from .perturbdiff_split import PerturbDiffSplit
 
 
@@ -40,17 +41,61 @@ def restore_rng(state, device):
         torch.cuda.set_rng_state(state["accelerator"], device)
 
 
-def generate_samples(model, diffusion, cfg, device, logger, datamodule, **kwargs):
-    from pytorch_lightning.utilities import move_data_to_device
+def validate_sampling_scale(values):
+    """Match the evaluator's log-expression scale guard; never repair values."""
+    if not np.isfinite(values).all():
+        raise ValueError("Sampling output contains non-finite expression values.")
+    if values.size and (values.min() < 0 or values.max() > 15):
+        raise ValueError(
+            f"Sampling output is outside the evaluator's log-expression scale: "
+            f"min={float(values.min()):.6g}, max={float(values.max()):.6g}. "
+            "Raw values are preserved; do not clip or renormalize to bypass this check."
+        )
+
+
+def sample_native_batch(model, diffusion, cfg, device, batch, genes):
+    """One unchanged upstream sample call, shared by inference and diagnostics."""
     from src.apps.sampling.sampling_generation_helpers import (
         build_gene_embedding_cache,
         build_self_condition,
-        collect_batch_covariates,
-        load_selected_genes,
         resolve_sampling_runner,
     )
 
+    batch["batch_emb"] = model._encode_covariates(batch)
+    gene_embeddings = build_gene_embedding_cache(model, batch, device)
+    condition = build_self_condition(cfg, model, batch, gene_embeddings)
+    sample_fn, sampling_kwargs = resolve_sampling_runner(cfg, diffusion, cfg.sampling.use_ddim)
+    samples, _ = sample_fn(
+        model.model,
+        tuple(batch["pert_emb"].shape),
+        self_condition=condition,
+        clip_denoised=cfg.sampling.clip_denoised,
+        device=device,
+        progress=False,
+        **sampling_kwargs,
+    )
+    if samples is None:
+        raise RuntimeError("Native sampler returned no samples")
+    columns = [str(g) for g in batch["col_genes"][0]]
+    if any([str(g) for g in row] != columns for row in batch["col_genes"]):
+        raise ValueError("Mixed gene order inside native batch")
+    lookup = {name: i for i, name in enumerate(columns)}
+    selected = torch.tensor([lookup[g] for g in genes], device=device)
+    masks = ~batch["is_padded_list"].bool()
+    values = samples[masks].index_select(-1, selected).float().cpu().numpy()
+    values *= float(cfg.data.normalize_counts or 1.0)
+    return values
+
+
+def generate_samples(model, diffusion, cfg, device, logger, datamodule, **kwargs):
+    from pytorch_lightning.utilities import move_data_to_device
+    from src.apps.sampling.sampling_generation_helpers import (
+        collect_batch_covariates,
+        load_selected_genes,
+    )
+
     device = torch.device(device)
+    validate_checkpoint_covariates(datamodule, model.cov_encoder.cov_cfg)
     root = Path(cfg.sampling.output_dir).resolve()
     shards = root / "batches"
     shards.mkdir(parents=True, exist_ok=True)
@@ -62,6 +107,7 @@ def generate_samples(model, diffusion, cfg, device, logger, datamodule, **kwargs
         "torch_version": torch.__version__,
         "evaluation_split": evaluation_split,
         "orchestration": "native_sampler_resumable_v1",
+        "covariate_alignment": datamodule.checkpoint_covariate_alignment,
     }
     contract_path = root / "sampling_contract.json"
     if contract_path.exists() and json.loads(contract_path.read_text()) != contract:
@@ -94,32 +140,9 @@ def generate_samples(model, diffusion, cfg, device, logger, datamodule, **kwargs
                 restore_rng(torch.load(rng_path, weights_only=False, map_location="cpu"), device)
             else:
                 started = time.monotonic()
-                batch["batch_emb"] = model._encode_covariates(batch)
-                gene_embeddings = build_gene_embedding_cache(model, batch, device)
-                condition = build_self_condition(cfg, model, batch, gene_embeddings)
-                sample_fn, sampling_kwargs = resolve_sampling_runner(
-                    cfg, diffusion, cfg.sampling.use_ddim
-                )
-                samples, _ = sample_fn(
-                    model.model,
-                    tuple(batch["pert_emb"].shape),
-                    self_condition=condition,
-                    clip_denoised=cfg.sampling.clip_denoised,
-                    device=device,
-                    progress=False,
-                    **sampling_kwargs,
-                )
-                if samples is None:
-                    raise RuntimeError("Native sampler returned no samples")
-                columns = [str(g) for g in batch["col_genes"][0]]
-                if any([str(g) for g in row] != columns for row in batch["col_genes"]):
-                    raise ValueError("Mixed gene order inside native batch")
-                lookup = {name: i for i, name in enumerate(columns)}
-                selected = torch.tensor([lookup[g] for g in genes], device=device)
-                values = samples[masks].index_select(-1, selected).float().cpu().numpy()
-                values *= float(cfg.data.normalize_counts or 1.0)
-                if values.shape != (len(batch_labels), 2000) or not np.isfinite(values).all():
-                    raise RuntimeError("Invalid native sampling output")
+                values = sample_native_batch(model, diffusion, cfg, device, batch, genes)
+                if values.shape != (len(batch_labels), 2000):
+                    raise RuntimeError("Unexpected native sampling output shape")
                 # Store the unmodified output. The final evaluator adapter clips
                 # tiny negative numerical values consistently across baselines.
                 temporary = path.with_suffix(".partial.npz")
@@ -135,6 +158,18 @@ def generate_samples(model, diffusion, cfg, device, logger, datamodule, **kwargs
                     len(values),
                     time.monotonic() - started,
                 )
+            try:
+                validate_sampling_scale(values)
+            except ValueError as exc:
+                write_manifest(
+                    root / "invalid_output.json",
+                    {
+                        "batch_index": index,
+                        "raw_batch": str(path),
+                        "error": str(exc),
+                    },
+                )
+                raise
             predictions.append(values)
             labels.append(batch_labels)
             write_manifest(
