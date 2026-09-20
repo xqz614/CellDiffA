@@ -1,0 +1,5 @@
+# Install the official CUDA wheels first; setup_replogle_autodl.sh does this.
+# These local-version pins prevent a CPU or different-CUDA wheel substitution.
+-r replogle-common.txt
+torch==2.5.1+cu124
+torchvision==0.20.1+cu124
