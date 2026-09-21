@@ -1,5 +1,10 @@
 # Replogle main-text-first experiments
 
+If the server has no Squidiff checkpoint and uploading is impractical, use
+[the train-on-server six-queue plan](REPLOGLE_SERVER_TRAIN_SQUIDIFF.md) instead.
+It trains once and automatically releases a matched vanilla/AdaCell pair.
+The instructions below assume that completed weights already exist.
+
 This plan supersedes the earlier six-lane *full* launch for the current writing
 deadline. It does not change or terminate existing processes. It starts no
 training and no extra generation seeds. Full-server results are not implied by

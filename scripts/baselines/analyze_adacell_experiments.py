@@ -97,7 +97,7 @@ def main():
     missing = []
     for lane in plan["lanes"]:
         for job in lane:
-            if job["kind"] == "train":
+            if job["kind"] in {"train", "train_squidiff"}:
                 continue
             output = root / "runs" / job["id"]
             prediction = output / (

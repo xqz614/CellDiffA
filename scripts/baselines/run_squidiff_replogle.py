@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import fcntl
 import hashlib
 import json
 import os
@@ -132,6 +133,9 @@ def main():
     for key in ("iterations", "batch_size", "validation_every", "patience", "num_threads"):
         if getattr(args, key) < 1:
             parser.error(f"--{key.replace('_', '-')} must be positive")
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    run_lock = (args.output_dir / ".squidiff.lock").open("a")
+    fcntl.flock(run_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     if args.stage == "predict" and not (args.output_dir / "training_progress.json").exists():
         raise ValueError("Prediction requires a completed training run in --output-dir")
     revision = subprocess.check_output(

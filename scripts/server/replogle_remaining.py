@@ -13,6 +13,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -37,6 +38,20 @@ def paths(config):
 
 
 def jobs(preset="full"):
+    if preset == "main-text-train":
+        lanes = jobs("main-text")
+        lanes[3] = [
+            dict(id="squidiff_training", kind="train_squidiff"),
+            dict(
+                id="squidiff_vanilla",
+                kind="squidiff",
+                mode="random",
+                particles=1,
+                requires="squidiff_training",
+            ),
+        ]
+        lanes[4][0]["requires"] = "squidiff_training"
+        return lanes
     if preset == "main-text":
         return [
             [
@@ -139,6 +154,39 @@ def command_for(config, job, gpu, *, smoke=False):
             "1" if smoke else "all",
         ]
         prediction = output / "celldiffa_scratch.h5ad"
+    elif job["kind"] == "train_squidiff":
+        command = [
+            python,
+            "-u",
+            str(repo / "scripts/baselines/run_squidiff_replogle.py"),
+            "--stage",
+            "train",
+            "--device",
+            "cuda:0",
+            "--num-threads",
+            "4",
+            "--reference-dir",
+            str(p["reference"]),
+            "--split-config",
+            str(p["split"]),
+            "--upstream-root",
+            str(repo / "external/Squidiff"),
+            "--output-dir",
+            str(output),
+            "--iterations",
+            "100000",
+            "--batch-size",
+            "64",
+            "--validation-every",
+            "5000",
+            "--patience",
+            "5",
+            "--seed",
+            "42",
+        ]
+        if smoke:
+            command += ["--smoke"]
+        prediction = None
     elif job["kind"] == "train":
         command = [
             python,
@@ -295,6 +343,25 @@ def evaluate(config, prediction, output, env):
     if table.perturbation.duplicated().any() or set(table.perturbation) != expected:
         raise ValueError("Evaluation does not cover exactly the full test perturbations")
     finite = np.isfinite(table.drop(columns="perturbation").to_numpy()).all()
+    run_config = output / "run_config.json"
+    if run_config.exists():
+        base = json.loads(run_config.read_text()).get("base", {})
+        if "unsupported_native_conditions" in base:
+            unknown = set(base["unsupported_native_conditions"])
+            if not unknown.issubset(expected):
+                raise ValueError("Native-unsupported conditions differ from evaluation labels")
+            supported = table.assign(
+                native_support=np.where(
+                    table.perturbation.isin(unknown), "native_unseen", "observed_in_training"
+                )
+            )
+            supported.to_csv(metrics / "metrics_with_native_support.csv", index=False)
+            supported.groupby("native_support").mean(numeric_only=True).to_csv(
+                metrics / "native_support_means.csv"
+            )
+            supported.groupby("native_support").size().to_csv(
+                metrics / "native_support_counts.csv", header=["perturbations"]
+            )
     atomic_json(
         output / "evaluated.json",
         dict(
@@ -309,16 +376,93 @@ def evaluate(config, prediction, output, env):
     )
 
 
+def training_ready(config, *, restarting=False):
+    """Early best.pt is not enough: require the trainer's successful completion marker."""
+    from celldiffa.benchmark.artifacts import sha256_file
+
+    root = Path(config["output_root"]) / "runs/squidiff_training"
+    ready = root / "training_ready.json"
+    state_path = root / "job_status.json"
+    if state_path.exists() and json.loads(state_path.read_text()).get("status") == "failed":
+        if restarting:
+            return False
+        raise RuntimeError(
+            "Squidiff training failed; inspect lane 3 and restart it after fixing the error"
+        )
+    if not ready.is_file():
+        return False
+    saved = json.loads(ready.read_text())
+    progress = json.loads((root / "training_progress.json").read_text())
+    checkpoint = root / "best.pt"
+    if (
+        progress.get("status") != "training_complete"
+        or progress.get("smoke")
+        or Path(config["squidiff_checkpoint"]).resolve() != checkpoint.resolve()
+        or saved["checkpoint_sha256"] != sha256_file(checkpoint)
+        or saved["config_sha256"] != sha256_file(root / "run_config.json")
+        or saved["progress_sha256"] != sha256_file(root / "training_progress.json")
+    ):
+        raise ValueError("Completed Squidiff training artifacts have changed or are incomplete")
+    return True
+
+
+def record_training_ready(config, output):
+    from celldiffa.benchmark.artifacts import sha256_file
+    from celldiffa.benchmark.backbone_experiments import atomic_json
+
+    progress = json.loads((output / "training_progress.json").read_text())
+    if progress.get("status") != "training_complete" or progress.get("smoke"):
+        raise ValueError("Training did not complete formally; not releasing dependent jobs")
+    if Path(config["squidiff_checkpoint"]).resolve() != (output / "best.pt").resolve():
+        raise ValueError("Training output differs from the bound checkpoint")
+    atomic_json(
+        output / "training_ready.json",
+        dict(
+            status="training_complete",
+            completed_at=timestamp(),
+            checkpoint_sha256=sha256_file(output / "best.pt"),
+            config_sha256=sha256_file(output / "run_config.json"),
+            progress_sha256=sha256_file(output / "training_progress.json"),
+        ),
+    )
+
+
+def wait_for_training(config, output, *, smoke=False, timeout_seconds=72 * 3600):
+    from celldiffa.benchmark.backbone_experiments import atomic_json
+
+    if training_ready(config):
+        return
+    if smoke:
+        raise RuntimeError("Run the training lane first; guided smoke requires completed weights")
+    started = time.monotonic()
+    atomic_json(
+        output / "job_status.json",
+        dict(
+            status="waiting_for_training",
+            dependency="squidiff_training",
+            since=timestamp(),
+        ),
+    )
+    print("WAITING for lane 3 to finish Squidiff training; no GPU inference is running", flush=True)
+    while not training_ready(config):
+        if time.monotonic() - started >= timeout_seconds:
+            raise TimeoutError("Training wait timed out; inspect lane 3 before resuming")
+        time.sleep(15)
+    print("Squidiff training complete and checkpoint verified; starting inference", flush=True)
+
+
 def launch_maintext(config, config_path, lanes, *, dry_run=False):
     """Start only the approved main-text plan; never stop existing screen jobs."""
-    if config.get("preset") != "main-text" or config["lanes"] != jobs("main-text"):
+    preset = config.get("preset")
+    if preset not in {"main-text", "main-text-train"} or config["lanes"] != jobs(preset):
         raise ValueError("launch-maintext requires an unchanged --preset main-text plan")
+    train_here = preset == "main-text-train"
     if len(lanes) != len(set(lanes)):
         raise ValueError("Do not request the same lane twice")
     root = Path(config["output_root"])
     commands = []
     for lane in lanes:
-        name = f"adacell-maintext-lane-{lane}"
+        name = f"adacell-maintext{'-train' if train_here else ''}-lane-{lane}"
         command = [
             "screen",
             "-L",
@@ -344,7 +488,8 @@ def launch_maintext(config, config_path, lanes, *, dry_run=False):
         raise RuntimeError("screen is not installed")
     listing = subprocess.run(["screen", "-ls"], capture_output=True, text=True)
     screen_state = listing.stdout + listing.stderr
-    if ".adacell-lane-" in screen_state:
+    other_prefix = ".adacell-maintext-lane-" if train_here else ".adacell-maintext-train-lane-"
+    if ".adacell-lane-" in screen_state or other_prefix in screen_state:
         raise RuntimeError(
             "An older adacell-lane screen session exists. Inspect it before launching "
             "the new plan; no existing process has been stopped."
@@ -365,18 +510,27 @@ def launch_maintext(config, config_path, lanes, *, dry_run=False):
             / "checkpoints/PerturbDiff_release_ckpt/from_scratch_replogle.ckpt"
         )
     if any(lane in {3, 4} for lane in lanes):
+        required.append(paths(config)["reference"] / "train.h5ad")
+        if train_here:
+            expected_checkpoint = root / "runs/squidiff_training/best.pt"
+            if config.get("squidiff_checkpoint") != str(
+                expected_checkpoint.resolve()
+            ) or config.get("squidiff_unseen_policy") not in {"zero_shift", "ridge"}:
+                raise ValueError("Retraining plan checkpoint or explicit unseen policy changed")
+            required.append(paths(config)["reference"] / "validation.h5ad")
+            required.append(Path(config["repo"]) / "external/Squidiff/Squidiff/script_util.py")
+        else:
+            checkpoint = Path(config.get("squidiff_checkpoint") or "missing-checkpoint")
+            required.extend(
+                [
+                    checkpoint,
+                    Path(config["squidiff_model_config"])
+                    if config.get("squidiff_model_config")
+                    else checkpoint.parent / "run_config.json",
+                ]
+            )
         if not config.get("squidiff_checkpoint"):
             raise ValueError("Bind the completed Squidiff checkpoint before launching lanes 3/4")
-        checkpoint = Path(config["squidiff_checkpoint"])
-        required.extend(
-            [
-                checkpoint,
-                Path(config["squidiff_model_config"])
-                if config.get("squidiff_model_config")
-                else checkpoint.parent / "run_config.json",
-                paths(config)["reference"] / "train.h5ad",
-            ]
-        )
     missing = [str(path) for path in required if not path.is_file()]
     if missing:
         raise FileNotFoundError("Required inputs are missing: " + ", ".join(missing))
@@ -392,7 +546,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="action", required=True)
     initialize = sub.add_parser("init")
-    initialize.add_argument("--preset", choices=["full", "main-text"], default="full")
+    initialize.add_argument(
+        "--preset", choices=["full", "main-text", "main-text-train"], default="full"
+    )
     initialize.add_argument("--output-root", type=Path)
     initialize.add_argument("--data-root", type=Path, default=REPO / "data")
     initialize.add_argument("--squidiff-checkpoint", type=Path)
@@ -434,7 +590,11 @@ def main():
 
     if args.action == "init":
         if args.output_root is None:
-            dirname = "maintext_v1" if args.preset == "main-text" else "remaining_v1"
+            dirname = {
+                "full": "remaining_v1",
+                "main-text": "maintext_v1",
+                "main-text-train": "maintext_train_v1",
+            }[args.preset]
             args.output_root = REPO / "results/replogle" / dirname
         config = dict(
             repo=str(REPO),
@@ -452,8 +612,17 @@ def main():
             squidiff_unseen_policy=args.squidiff_unseen_policy,
             policy="alpha=1 fixed; other test runs are sensitivity checks, never test-selected",
         )
-        if args.preset == "main-text":
-            config["preset"] = "main-text"
+        if args.preset in {"main-text", "main-text-train"}:
+            config["preset"] = args.preset
+        if args.preset == "main-text-train":
+            if args.squidiff_checkpoint or args.squidiff_model_config:
+                parser.error("This preset trains one checkpoint; do not bind external weights")
+            if args.squidiff_unseen_policy not in {"zero_shift", "ridge"}:
+                parser.error("Explicitly choose --squidiff-unseen-policy zero_shift or ridge")
+            config["squidiff_checkpoint"] = str(
+                args.output_root.resolve() / "runs/squidiff_training/best.pt"
+            )
+            config["squidiff_sampling_steps"] = 100
         if any(g < 0 for g in args.gpus):
             parser.error("GPU indices must be nonnegative")
         path = args.output_root / "plan.json"
@@ -474,6 +643,8 @@ def main():
         launch_maintext(config, args.config, args.lanes, dry_run=args.dry_run)
         return
     if args.action == "configure-squidiff":
+        if config.get("preset") == "main-text-train":
+            parser.error("This preset manages its own weights and shared inference settings")
         if not args.checkpoint.is_file():
             raise FileNotFoundError(args.checkpoint)
         if args.sampling_steps is not None and args.sampling_steps < 2:
@@ -497,8 +668,23 @@ def main():
         for lane, items in enumerate(config["lanes"]):
             for job in items:
                 output = Path(config["output_root"]) / "runs" / job["id"]
+                state_path = (
+                    output / "job_status.json"
+                    if job["kind"] != "mean"
+                    else (output.parent / f"{output.name}.job_status.json")
+                )
+                if state_path.exists():
+                    state = json.loads(state_path.read_text())
+                    if state.get("status") in {"failed", "waiting_for_training"}:
+                        print(lane, job["id"], json.dumps(state))
+                        continue
                 found = False
-                for name in ("evaluated.json", "progress.json", "training_progress.json"):
+                for name in (
+                    "evaluated.json",
+                    "progress.json",
+                    "training_progress.json",
+                    "job_status.json",
+                ):
                     if (output / name).exists():
                         print(lane, job["id"], (output / name).read_text().strip())
                         found = True
@@ -571,9 +757,18 @@ def main():
         )
         job_env = {**env, **changes}
         if args.dry_run:
+            if job.get("requires"):
+                print("WAIT for completed training: " + job["requires"])
             print(shlex.join(command))
             continue
         from celldiffa.benchmark.artifacts import sha256_file
+
+        if job.get("requires"):
+            try:
+                wait_for_training(config, output, smoke=args.action == "smoke")
+            except BaseException as error:
+                atomic_json(output / "job_status.json", dict(status="failed", error=str(error)))
+                raise
 
         launch_record = dict(job=job, command=command, overrides=changes)
         if job["kind"] == "perturbdiff":
@@ -597,6 +792,13 @@ def main():
         if launch_path.exists() and json.loads(launch_path.read_text()) != launch_record:
             raise ValueError("Job checkpoint, policy or settings changed; use a new output root")
         atomic_json(launch_path, launch_record)
+        if (
+            job["kind"] == "train_squidiff"
+            and args.action != "smoke"
+            and training_ready(config, restarting=True)
+        ):
+            print("Squidiff training already complete; reusing the verified checkpoint", flush=True)
+            continue
         marker = output / "evaluated.json"
         if marker.exists() and prediction is not None:
             saved = json.loads(marker.read_text())
@@ -615,22 +817,35 @@ def main():
                 raise ValueError("Completed prediction was changed; refusing to reuse evaluation")
             print(f"Already evaluated: {job['id']}", flush=True)
             continue
-        # Mean correction refuses overwrites; a successful prediction can resume evaluation.
-        if not (job["kind"] == "mean" and prediction.is_file()):
-            execute(
-                command,
-                config,
-                job_env,
-                output.parent / f"{output.name}.launcher.log"
-                if job["kind"] == "mean"
-                else output / "run.log",
-            )
-        if args.action == "smoke":
-            print("SMOKE ONLY: partial result, not a benchmark score")
-        elif prediction is not None:
-            if not prediction.is_file():
-                raise RuntimeError("No complete H5AD produced; evaluation will not start")
-            evaluate(config, prediction, output, job_env)
+        # Keep the mean-correction output absent until its own atomic writer creates it.
+        state_path = (
+            output / "job_status.json"
+            if job["kind"] != "mean"
+            else (output.parent / f"{output.name}.job_status.json")
+        )
+        atomic_json(state_path, dict(status="running", started_at=timestamp(), pid=os.getpid()))
+        try:
+            if not (job["kind"] == "mean" and prediction.is_file()):
+                execute(
+                    command,
+                    config,
+                    job_env,
+                    output.parent / f"{output.name}.launcher.log"
+                    if job["kind"] == "mean"
+                    else output / "run.log",
+                )
+            if args.action == "smoke":
+                print("SMOKE ONLY: partial result, not a benchmark score")
+            elif job["kind"] == "train_squidiff":
+                record_training_ready(config, output)
+            elif prediction is not None:
+                if not prediction.is_file():
+                    raise RuntimeError("No complete H5AD produced; evaluation will not start")
+                evaluate(config, prediction, output, job_env)
+        except BaseException as error:
+            atomic_json(state_path, dict(status="failed", error=str(error), at=timestamp()))
+            raise
+        atomic_json(state_path, dict(status="complete", completed_at=timestamp()))
     print(f"Lane {args.lane} finished", flush=True)
 
 
