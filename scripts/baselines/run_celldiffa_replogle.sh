@@ -118,6 +118,7 @@ celldiffa_args=(
   "--evaluation-split" "$evaluation_split"
   "--alpha" "${CELLDIFFA_ALPHA:-1.0}"
   "--alignment-mode" "${CELLDIFFA_ALIGNMENT_MODE:-smc}"
+  "--reward-unit" "${CELLDIFFA_REWARD_UNIT:-population}"
   "--reward-normalization" "${CELLDIFFA_REWARD_NORMALIZATION:-zscore}"
   "--ess-threshold" "${CELLDIFFA_ESS_THRESHOLD:-0.5}"
   "--seed" "${CELLDIFFA_SEED:-42}"

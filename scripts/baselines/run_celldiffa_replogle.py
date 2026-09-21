@@ -30,6 +30,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--reward-weights", nargs=3, type=float, default=[1.0, 1.0, 1.0])
     parser.add_argument("--reward-normalization", choices=["zscore", "none"], default="zscore")
     parser.add_argument("--alignment-mode", choices=["smc", "best_of_n", "random"], default="smc")
+    parser.add_argument("--reward-unit", choices=["population", "cell"], default="population")
     parser.add_argument("--num-particles", type=int, default=16)
     parser.add_argument("--particle-batch-cells", type=int, default=128)
     parser.add_argument("--native-blocks-per-population", type=int, default=1)
@@ -117,6 +118,7 @@ def main() -> None:
         ProjectedReward,
         TranscriptomicReward,
     )
+    from celldiffa.rewards.cellwise import IndependentCellReward
     from celldiffa.smc import SMCConfig, SMCEngine
     from scripts.baselines.perturbdiff_sampling_entrypoint import (
         load_sampling_model_portable,
@@ -186,6 +188,9 @@ def main() -> None:
         "guidance_strength": float(cfg.sampling.guidance_strength),
     }
     run_config_path = shard_root / "run_config.json"
+    # Preserve the original population run contract for existing server runs.
+    if args.reward_unit != "population":
+        run_config["reward_unit"] = args.reward_unit
     # One worker establishes the run contract and prior cache; other GPU
     # workers wait, then reuse both. This prevents cache races and accidental
     # mixing of shards from different CellDiffA settings.
@@ -299,7 +304,8 @@ def main() -> None:
                     .float()
                 )
                 ctrl_mean = eval_controls.mean(dim=0).cpu().numpy()
-                base_reward = CompositeReward(
+                reward_class = IndependentCellReward if args.reward_unit == "cell" else CompositeReward
+                base_reward = reward_class(
                     [
                         TranscriptomicReward(
                             priors.de_genes,
@@ -362,12 +368,18 @@ def main() -> None:
                     seed=args.seed + group_index,
                     alignment_mode=args.alignment_mode,
                 )
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                group_started = time.perf_counter()
                 result = SMCEngine(sampler, reward, smc_config).sample_with_alignment(
                     perturbation,
                     condition,
                     ctrl_cells=controls,
                     num_genes=controls.shape[-1],
                 )
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                group_seconds = time.perf_counter() - group_started
                 samples = result["samples"][mask]
                 samples = samples.index_select(
                     -1, torch.as_tensor(eval_indices, device=samples.device)
@@ -391,6 +403,7 @@ def main() -> None:
                         "final_weights": result["weights"].tolist(),
                         "distinct_initial_ancestors": result["ancestor_history"],
                         "denoised_cell_steps": result["denoised_cell_steps"],
+                        "sampling_seconds": group_seconds,
                     },
                 )
                 processed_now += 1

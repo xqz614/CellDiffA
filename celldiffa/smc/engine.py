@@ -374,7 +374,9 @@ class SMCEngine:
     # ------------------------------------------------------------------
 
     def _validate_config(self) -> None:
-        if self.config.num_particles < 2:
+        if self.config.num_particles == 1 and self.config.alignment_mode == "random":
+            pass  # One-candidate frozen-backbone reference; never resampled.
+        elif self.config.num_particles < 2:
             raise ValueError("num_particles must be at least 2.")
         if self.config.cells_per_particle < 2:
             raise ValueError("cells_per_particle must be at least 2.")
