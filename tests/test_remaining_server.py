@@ -1,5 +1,7 @@
 import json
 import sys
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -84,3 +86,98 @@ def test_smoke_uses_separate_outputs_and_partial_coverage(tmp_path):
         settings, settings["lanes"][0][0], 0, smoke=True
     )
     assert pd_output.parent.name == "smoke" and pd_command[-1] == "1"
+
+
+def test_maintext_preset_has_six_independent_jobs_without_training_or_extra_seeds():
+    lanes = server.jobs("main-text")
+    assert [lane[0]["id"] for lane in lanes] == [
+        "scratch_random16",
+        "scratch_best16",
+        "scratch_cellwise16",
+        "squidiff_vanilla",
+        "squidiff_adacell16",
+        "scratch_particles8",
+    ]
+    assert lanes[0][1] == dict(id="scratch_mean_correction", kind="mean", parent="scratch_random16")
+    assert all(len(lane) == 1 for lane in lanes[1:])
+    assert all(job.get("seed", 42) == 42 for lane in lanes for job in lane)
+    assert all(job["kind"] != "train" for lane in lanes for job in lane)
+    with pytest.raises(ValueError, match="Unknown"):
+        server.jobs("unexpected")
+
+
+def test_maintext_plan_is_separate_from_old_plan(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "REPO", tmp_path)
+    monkeypatch.setattr(server.subprocess, "run", lambda *a, **k: pytest.fail("Launched from init"))
+    monkeypatch.setattr(sys, "argv", ["plan", "init"])
+    server.main()
+    old = tmp_path / "results/replogle/remaining_v1/plan.json"
+    previous = old.read_bytes()
+    monkeypatch.setattr(sys, "argv", ["plan", "init", "--preset", "main-text"])
+    server.main()
+    new = json.loads((tmp_path / "results/replogle/maintext_v1/plan.json").read_text())
+    assert new["preset"] == "main-text" and new["lanes"] == server.jobs("main-text")
+    assert old.read_bytes() == previous
+
+
+def test_maintext_launch_dry_run_and_old_plan_rejection(tmp_path, monkeypatch, capsys):
+    settings = config(tmp_path)
+    monkeypatch.setattr(
+        server.subprocess, "run", lambda *a, **k: pytest.fail("Launched from dry run")
+    )
+    with pytest.raises(ValueError, match="requires"):
+        server.launch_maintext(settings, tmp_path / "plan.json", list(range(6)), dry_run=True)
+    settings.update(preset="main-text", lanes=server.jobs("main-text"))
+    server.launch_maintext(settings, tmp_path / "plan.json", list(range(6)), dry_run=True)
+    output = capsys.readouterr().out
+    assert output.count("screen -L") == 6
+    assert "adacell-maintext-lane-5" in output and "--config" in output
+
+
+def test_maintext_launch_preflights_before_start_and_skips_duplicate_sessions(
+    tmp_path, monkeypatch
+):
+    import torch
+
+    from celldiffa.benchmark import metrics
+
+    settings = config(tmp_path)
+    settings.update(preset="main-text", lanes=server.jobs("main-text"))
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/usr/bin/screen")
+    listing = SimpleNamespace(stdout="", stderr="", returncode=1)
+    launched = []
+
+    def run(command, **kwargs):
+        if command == ["screen", "-ls"]:
+            return listing
+        launched.append(command)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(server.subprocess, "run", run)
+    monkeypatch.setattr(metrics, "_require_cell_eval_066", lambda: None)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 3)
+    with pytest.raises(FileNotFoundError, match="missing"):
+        server.launch_maintext(settings, tmp_path / "plan.json", list(range(6)))
+    assert not launched
+    p = server.paths(settings)
+    required = [p[key] for key in ("source", "genes", "embeddings", "split")]
+    required += [p["reference"] / name for name in ("real.h5ad", "controls.h5ad", "train.h5ad")]
+    checkpoint = Path(settings["squidiff_checkpoint"])
+    required += [checkpoint, checkpoint.parent / "run_config.json"]
+    required += [
+        Path(settings["data_root"])
+        / "checkpoints/PerturbDiff_release_ckpt/from_scratch_replogle.ckpt"
+    ]
+    for path in required:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    listing.stdout = "123.adacell-maintext-lane-2\t(Detached)"
+    server.launch_maintext(settings, tmp_path / "plan.json", list(range(6)))
+    assert len(launched) == 5
+    assert all("adacell-maintext-lane-2" not in command for command in launched)
+    launched.clear()
+    listing.stdout = "123.adacell-lane-5\t(Detached)"
+    with pytest.raises(RuntimeError, match="older"):
+        server.launch_maintext(settings, tmp_path / "plan.json", list(range(6)))
+    assert not launched

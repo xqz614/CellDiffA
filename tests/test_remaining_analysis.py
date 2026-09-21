@@ -12,6 +12,17 @@ from sklearn.metrics import r2_score
 from scripts.baselines import analyze_adacell_experiments as analysis
 
 
+def test_backbone_pairs_label_unmatched_budget_and_prefer_matched_reference():
+    tables = {"squidiff_vanilla": None, "squidiff_adacell16": None}
+    assert analysis.backbone_comparisons(tables) == [
+        ("Squidiff", "squidiff_adacell16", "squidiff_vanilla", False)
+    ]
+    tables["squidiff_random16"] = None
+    assert analysis.backbone_comparisons(tables) == [
+        ("Squidiff", "squidiff_adacell16", "squidiff_random16", True)
+    ]
+
+
 def test_analysis_plots_and_rejects_mismatched_metrics(tmp_path, monkeypatch):
     pytest.importorskip("matplotlib")
     reference = tmp_path / "results/replogle/reference"

@@ -57,6 +57,24 @@ def effect_strata(real):
     return frame.set_index("perturbation")
 
 
+def backbone_comparisons(tables):
+    pairs = []
+    for label, guided, matched, vanilla in (
+        ("PerturbDiff", "scratch_main", "scratch_random16", None),
+        ("Squidiff", "squidiff_adacell16", "squidiff_random16", "squidiff_vanilla"),
+        (
+            "Conditional DDPM",
+            "conditional_ddpm_adacell16",
+            "conditional_ddpm_random16",
+            "conditional_ddpm_vanilla",
+        ),
+    ):
+        baseline = matched if matched in tables else vanilla
+        if guided in tables and baseline is not None and baseline in tables:
+            pairs.append((label, guided, baseline, baseline == matched))
+    return pairs
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plan", type=Path, required=True)
@@ -285,22 +303,25 @@ def main():
             axis.set(xlabel="Response accuracy (PDS-cos)", ylabel=metric)
     axes[0].axhline(1, color="gray", linestyle="--", linewidth=0.7)
     save(fig, "accuracy_diversity")
-    backbone_pairs = [
-        (label, guided, baseline)
-        for label, guided, baseline in (
-            ("PerturbDiff", "scratch_main", "scratch_random16"),
-            ("Squidiff", "squidiff_adacell16", "squidiff_random16"),
-            ("Conditional DDPM", "conditional_ddpm_adacell16", "conditional_ddpm_random16"),
-        )
-        if guided in tables and baseline in tables
-    ]
+    backbone_pairs = backbone_comparisons(tables)
     if backbone_pairs:
         fig, axes = plt.subplots(1, 2, figsize=(7, 2.7), constrained_layout=True)
         gains = []
         for axis, metric in zip(axes, ("DEOver", "PDS_cos")):
-            for index, (label, guided, baseline) in enumerate(backbone_pairs):
+            for index, (label, guided, baseline, matched) in enumerate(backbone_pairs):
                 mean, low, high = bootstrap(tables[guided][metric] - tables[baseline][metric])
-                gains.append(dict(backbone=label, metric=metric, mean=mean, low=low, high=high))
+                gains.append(
+                    dict(
+                        backbone=label,
+                        metric=metric,
+                        mean=mean,
+                        low=low,
+                        high=high,
+                        guided=guided,
+                        baseline=baseline,
+                        matched_denoising_budget=matched,
+                    )
+                )
                 axis.errorbar(
                     index,
                     mean,
@@ -311,8 +332,13 @@ def main():
             axis.axhline(0, color="gray", linestyle="--", linewidth=0.7)
             axis.set(
                 xticks=list(range(len(backbone_pairs))),
-                xticklabels=[pair[0] for pair in backbone_pairs],
-                ylabel=f"Δ {metric} versus unselected16",
+                xticklabels=[
+                    label
+                    + "\nvs "
+                    + ("random16 (matched)" if matched else "vanilla1 (unequal budget)")
+                    for label, _, _, matched in backbone_pairs
+                ],
+                ylabel=f"Δ {metric} versus indicated reference",
             )
             axis.tick_params(axis="x", labelsize=7)
         pd.DataFrame(gains).to_csv(args.outdir / "paired_backbone_gains.csv", index=False)
@@ -330,6 +356,7 @@ def main():
                 "Effect strata are descriptive, not denoising-loss causal evidence",
                 "Variance/rank/W1 do not prove biological realism or support preservation",
                 "Concurrent-job timings in CSV are not isolated GPU cost benchmarks",
+                "Backbone pairs versus vanilla1 are not matched-denoising-budget comparisons",
             ],
         ),
     )

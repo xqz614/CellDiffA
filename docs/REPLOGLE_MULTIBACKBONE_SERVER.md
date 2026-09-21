@@ -1,5 +1,10 @@
 # AdaCell multi-backbone experiments on Replogle
 
+**Current writing priority:** use the narrower
+[main-text-first plan](REPLOGLE_MAIN_TEXT_FIRST.md). It omits extra seeds and
+conditional-DDPM training. The six-lane table below remains the older full plan;
+do not launch it when following the main-text-first instructions.
+
 This release adds runnable adapters and controls, not completed scientific
 results. Local verification uses small CPU fixtures and the pinned native
 Squidiff kernel. Full CUDA experiments must run on the user's server. Existing

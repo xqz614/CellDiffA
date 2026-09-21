@@ -10,6 +10,7 @@ import fcntl
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -35,7 +36,21 @@ def paths(config):
     )
 
 
-def jobs():
+def jobs(preset="full"):
+    if preset == "main-text":
+        return [
+            [
+                dict(id="scratch_random16", kind="perturbdiff", mode="random"),
+                dict(id="scratch_mean_correction", kind="mean", parent="scratch_random16"),
+            ],
+            [dict(id="scratch_best16", kind="perturbdiff", mode="best_of_n")],
+            [dict(id="scratch_cellwise16", kind="perturbdiff", mode="smc", unit="cell")],
+            [dict(id="squidiff_vanilla", kind="squidiff", mode="random", particles=1)],
+            [dict(id="squidiff_adacell16", kind="squidiff", mode="smc")],
+            [dict(id="scratch_particles8", kind="perturbdiff", mode="smc", particles=8)],
+        ]
+    if preset != "full":
+        raise ValueError(f"Unknown experiment preset: {preset}")
     return [
         [
             dict(id="scratch_random16", kind="perturbdiff", mode="random"),
@@ -294,13 +309,91 @@ def evaluate(config, prediction, output, env):
     )
 
 
+def launch_maintext(config, config_path, lanes, *, dry_run=False):
+    """Start only the approved main-text plan; never stop existing screen jobs."""
+    if config.get("preset") != "main-text" or config["lanes"] != jobs("main-text"):
+        raise ValueError("launch-maintext requires an unchanged --preset main-text plan")
+    if len(lanes) != len(set(lanes)):
+        raise ValueError("Do not request the same lane twice")
+    root = Path(config["output_root"])
+    commands = []
+    for lane in lanes:
+        name = f"adacell-maintext-lane-{lane}"
+        command = [
+            "screen",
+            "-L",
+            "-Logfile",
+            str(root / f"lane_{lane}.screen.log"),
+            "-dmS",
+            name,
+            config["python"],
+            "-u",
+            str(Path(config["repo"]) / "scripts/server/replogle_remaining.py"),
+            "run",
+            "--config",
+            str(config_path.resolve()),
+            "--lane",
+            str(lane),
+        ]
+        commands.append((name, command))
+    if dry_run:
+        for _, command in commands:
+            print(shlex.join(command))
+        return
+    if not shutil.which("screen"):
+        raise RuntimeError("screen is not installed")
+    listing = subprocess.run(["screen", "-ls"], capture_output=True, text=True)
+    screen_state = listing.stdout + listing.stderr
+    if ".adacell-lane-" in screen_state:
+        raise RuntimeError(
+            "An older adacell-lane screen session exists. Inspect it before launching "
+            "the new plan; no existing process has been stopped."
+        )
+    from celldiffa.benchmark.metrics import _require_cell_eval_066
+
+    _require_cell_eval_066()
+    import torch
+
+    requested_gpus = {config["gpus"][lane % len(config["gpus"])] for lane in lanes}
+    if not torch.cuda.is_available() or max(requested_gpus) >= torch.cuda.device_count():
+        raise RuntimeError("Requested GPUs are unavailable")
+    required = [paths(config)[key] for key in ("source", "genes", "embeddings", "split")]
+    required.extend(paths(config)["reference"] / file for file in ("real.h5ad", "controls.h5ad"))
+    if any(lane in {0, 1, 2, 5} for lane in lanes):
+        required.append(
+            Path(config["data_root"])
+            / "checkpoints/PerturbDiff_release_ckpt/from_scratch_replogle.ckpt"
+        )
+    if any(lane in {3, 4} for lane in lanes):
+        if not config.get("squidiff_checkpoint"):
+            raise ValueError("Bind the completed Squidiff checkpoint before launching lanes 3/4")
+        checkpoint = Path(config["squidiff_checkpoint"])
+        required.extend(
+            [
+                checkpoint,
+                Path(config["squidiff_model_config"])
+                if config.get("squidiff_model_config")
+                else checkpoint.parent / "run_config.json",
+                paths(config)["reference"] / "train.h5ad",
+            ]
+        )
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        raise FileNotFoundError("Required inputs are missing: " + ", ".join(missing))
+    for name, command in commands:
+        if f".{name}" in screen_state:
+            print(f"Already has a screen session; not launching a duplicate: {name}")
+            continue
+        subprocess.run(command, cwd=config["repo"], check=True)
+        print(f"Screen launch requested: {name}; check status and its lane log", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="action", required=True)
     initialize = sub.add_parser("init")
-    initialize.add_argument(
-        "--output-root", type=Path, default=REPO / "results/replogle/remaining_v1"
-    )
+    initialize.add_argument("--preset", choices=["full", "main-text"], default="full")
+    initialize.add_argument("--output-root", type=Path)
     initialize.add_argument("--data-root", type=Path, default=REPO / "data")
     initialize.add_argument("--squidiff-checkpoint", type=Path)
     initialize.add_argument("--squidiff-model-config", type=Path)
@@ -317,6 +410,12 @@ def main():
     bind.add_argument(
         "--unseen-policy", choices=["auto", "error", "zero_shift", "ridge"], default="auto"
     )
+    launch = sub.add_parser("launch-maintext")
+    launch.add_argument(
+        "--config", type=Path, default=REPO / "results/replogle/maintext_v1/plan.json"
+    )
+    launch.add_argument("--lanes", type=int, choices=range(6), nargs="+", default=list(range(6)))
+    launch.add_argument("--dry-run", action="store_true")
     for action in ("prepare", "run", "smoke", "status"):
         command = sub.add_parser(action)
         command.add_argument(
@@ -329,13 +428,16 @@ def main():
     from celldiffa.benchmark.backbone_experiments import atomic_json
 
     if args.action == "init":
+        if args.output_root is None:
+            dirname = "maintext_v1" if args.preset == "main-text" else "remaining_v1"
+            args.output_root = REPO / "results/replogle" / dirname
         config = dict(
             repo=str(REPO),
             python=sys.executable,
             data_root=str(args.data_root.resolve()),
             output_root=str(args.output_root.resolve()),
             gpus=args.gpus,
-            lanes=jobs(),
+            lanes=jobs(args.preset),
             squidiff_checkpoint=str(args.squidiff_checkpoint.resolve())
             if args.squidiff_checkpoint
             else None,
@@ -345,6 +447,8 @@ def main():
             squidiff_unseen_policy=args.squidiff_unseen_policy,
             policy="alpha=1 fixed; other test runs are sensitivity checks, never test-selected",
         )
+        if args.preset == "main-text":
+            config["preset"] = "main-text"
         if any(g < 0 for g in args.gpus):
             parser.error("GPU indices must be nonnegative")
         path = args.output_root / "plan.json"
@@ -361,6 +465,9 @@ def main():
     config = json.loads(args.config.read_text())
     if Path(config["repo"]).resolve() != REPO:
         raise ValueError("Create this plan on the server; do not copy a local plan")
+    if args.action == "launch-maintext":
+        launch_maintext(config, args.config, args.lanes, dry_run=args.dry_run)
+        return
     if args.action == "configure-squidiff":
         if not args.checkpoint.is_file():
             raise FileNotFoundError(args.checkpoint)
@@ -370,7 +477,12 @@ def main():
             squidiff_unseen_policy=args.unseen_policy,
         )
         atomic_json(args.config, config)
-        print("Squidiff checkpoint bound; lanes 2 and 3 have NOT been launched")
+        squidiff_lanes = [
+            index
+            for index, lane in enumerate(config["lanes"])
+            if any(job["kind"] == "squidiff" for job in lane)
+        ]
+        print(f"Squidiff checkpoint bound; lanes {squidiff_lanes} have NOT been launched")
         return
     if args.action == "status":
         for lane, items in enumerate(config["lanes"]):
