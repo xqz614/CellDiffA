@@ -53,6 +53,50 @@ def test_unbound_squidiff_never_launches_or_uses_random_weights(tmp_path):
     assert server.command_for(settings, settings["lanes"][0][0], 0)[0]
 
 
+def test_existing_squidiff_sampling_schedule_can_be_preserved(tmp_path):
+    settings = config(tmp_path)
+    settings["squidiff_sampling_steps"] = 1000
+    for lane in settings["lanes"]:
+        for job in lane:
+            if job["kind"] not in {"squidiff", "conditional_ddpm"}:
+                continue
+            command, _, _, _ = server.command_for(settings, job, 0)
+            expected = "1000" if job["kind"] == "squidiff" else "100"
+            assert command[command.index("--sampling-steps") + 1] == expected
+
+
+def test_squidiff_schedule_binding_does_not_launch_other_jobs(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "REPO", tmp_path)
+    settings = config(tmp_path)
+    settings.update(preset="main-text", lanes=server.jobs("main-text"))
+    path = tmp_path / "plan.json"
+    path.write_text(json.dumps(settings))
+    checkpoint = Path(settings["squidiff_checkpoint"])
+    checkpoint.parent.mkdir()
+    checkpoint.touch()
+    monkeypatch.setattr(
+        server.subprocess, "run", lambda *a, **k: pytest.fail("Launched from binding")
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "plan",
+            "configure-squidiff",
+            "--config",
+            str(path),
+            "--checkpoint",
+            str(checkpoint),
+            "--sampling-steps",
+            "1000",
+        ],
+    )
+    server.main()
+    updated = json.loads(path.read_text())
+    assert updated["squidiff_sampling_steps"] == 1000
+    assert updated["lanes"] == server.jobs("main-text")
+
+
 def test_environment_cleans_stale_experimental_overrides(tmp_path, monkeypatch):
     monkeypatch.setenv("CELLDIFFA_ALPHA", "999")
     monkeypatch.setenv("CELLDIFFA_REWARD_UNIT", "cell")

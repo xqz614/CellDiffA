@@ -217,7 +217,7 @@ def command_for(config, job, gpu, *, smoke=False):
             "--population-cells",
             "512",
             "--sampling-steps",
-            "100",
+            str(config.get("squidiff_sampling_steps", 100)) if job["kind"] == "squidiff" else "100",
             "--alpha",
             "1",
             "--seed",
@@ -408,6 +408,11 @@ def main():
     bind.add_argument("--checkpoint", type=Path, required=True)
     bind.add_argument("--model-config", type=Path)
     bind.add_argument(
+        "--sampling-steps",
+        type=int,
+        help="Squidiff inference steps; match the old baseline, not just its training schedule",
+    )
+    bind.add_argument(
         "--unseen-policy", choices=["auto", "error", "zero_shift", "ridge"], default="auto"
     )
     launch = sub.add_parser("launch-maintext")
@@ -471,11 +476,15 @@ def main():
     if args.action == "configure-squidiff":
         if not args.checkpoint.is_file():
             raise FileNotFoundError(args.checkpoint)
+        if args.sampling_steps is not None and args.sampling_steps < 2:
+            parser.error("sampling-steps must be at least 2")
         config.update(
             squidiff_checkpoint=str(args.checkpoint.resolve()),
             squidiff_model_config=str(args.model_config.resolve()) if args.model_config else None,
             squidiff_unseen_policy=args.unseen_policy,
         )
+        if args.sampling_steps is not None:
+            config["squidiff_sampling_steps"] = args.sampling_steps
         atomic_json(args.config, config)
         squidiff_lanes = [
             index

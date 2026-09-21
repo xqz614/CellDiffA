@@ -119,3 +119,42 @@ Only measure GPU runtime with `benchmark_replogle_steering_cost.py` when that
 GPU is idle. Concurrent-job timings are not fair latency measurements. The
 eight-particle full-test job supplies an accuracy point; the isolated timing
 script supplies its comparable latency measurement.
+
+## Only run Squidiff + AdaCell; keep the old Squidiff result
+
+Do **not** launch lane 3 or the whole plan when only AdaCell is requested:
+
+```bash
+python scripts/server/replogle_remaining.py launch-maintext --lanes 4
+```
+
+This starts one guided inference job plus its evaluation, with no model training
+or unguided Squidiff generation. Copy an existing weight to this server if it is
+only on the Mac; Git does not include checkpoints. The Mac's
+`results/replogle/squidiff_cpu/best.pt` was verified loadable and its training log
+records completion at 100,000 steps, but that directory contains no prediction
+configuration. This is evidence of trained weights, not proof that an existing
+baseline score used those weights.
+
+Before comparing to an existing baseline, identify its exact checkpoint,
+gene order, split, normalization, control sampling, inference step count,
+and unseen-perturbation rule. The repository's original
+`run_squidiff_replogle.py` uses the native 1,000-step DDIM inference loop. The
+new adapter otherwise defaults to 100 respaced steps, which is **not** directly
+interchangeable with that baseline. For a confirmed 1,000-step baseline, bind:
+
+```bash
+python scripts/server/replogle_remaining.py configure-squidiff \
+  --config results/replogle/maintext_v1/plan.json \
+  --checkpoint /ACTUAL/SQUIDIFF/DIRECTORY/best.pt \
+  --sampling-steps 1000
+```
+
+Use another step count only when supported by the actual previous inference
+configuration. Do not infer inference steps merely from the training schedule.
+If `prediction_config.json` is absent, ask for the original command/configuration
+before choosing `--unseen-policy`; never silently choose `zero_shift` or `ridge`.
+The existing contract refuses to mix changed settings into old prediction shards.
+Changing only the step count does not by itself verify every other comparison
+setting. You can generate a guided result without rerunning the baseline, but
+cannot claim a controlled gain until the old result's provenance is established.
