@@ -133,3 +133,6 @@ on an idle GPU, not from competing queue timings.
 Local unit/synthetic tests validate scheduling and contracts, not full server
 CUDA training, elapsed time, or scientific performance. Check server logs after
 launch; a successful `screen` launch alone is not evidence of completed work.
+
+To collect the main, ablation and new queue results into one read-only report,
+see [the server result inventory](REPLOGLE_RESULT_REPORT.md).
