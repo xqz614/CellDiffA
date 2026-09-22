@@ -11,6 +11,7 @@ import pandas as pd
 from scipy import sparse
 from sklearn.metrics import r2_score
 
+from .artifacts import sha256_file, write_manifest
 from .contracts import validate_prediction_pair
 
 CELL_EVAL_VERSION = "0.6.6"
@@ -58,6 +59,58 @@ def _require_cell_eval_066() -> None:
         )
 
 
+def expression_scale_summary(adata, *, block_rows: int = 1024) -> dict:
+    """Audit every entry without changing it or densifying a full sparse matrix."""
+    if block_rows < 1:
+        raise ValueError("block_rows must be positive")
+    total = int(adata.n_obs * adata.n_vars)
+    if not total:
+        raise ValueError("Cannot evaluate an empty expression matrix")
+    negative = nonfinite = high = 0
+    minimum, maximum, summed = float("inf"), -float("inf"), 0.0
+    for start in range(0, adata.n_obs, block_rows):
+        block = adata.X[start : start + block_rows]
+        values = block.data if sparse.issparse(block) else np.asarray(block).reshape(-1)
+        finite = np.isfinite(values)
+        nonfinite += int((~finite).sum())
+        values = values[finite]
+        if values.size:
+            minimum = min(minimum, float(values.min()))
+            maximum = max(maximum, float(values.max()))
+            summed += float(values.sum(dtype=np.float64))
+            negative += int((values < 0).sum())
+            high += int((values >= 15).sum())
+        if sparse.issparse(block) and block.nnz < block.shape[0] * block.shape[1]:
+            minimum, maximum = min(minimum, 0.0), max(maximum, 0.0)
+    return dict(
+        shape=[adata.n_obs, adata.n_vars],
+        entries=total,
+        nonfinite=nonfinite,
+        negative=negative,
+        minimum=minimum if np.isfinite(minimum) else None,
+        maximum=maximum if np.isfinite(maximum) else None,
+        mean=summed / (total - nonfinite) if total > nonfinite else None,
+        entries_ge_15=high,
+        fraction_ge_15=high / total,
+    )
+
+
+def explicit_log1p_options(real, pred) -> tuple[dict, dict]:
+    """Declare known log1p units, not a transform or an automatic scale repair.
+
+    In Cell-Eval 0.6.6 allow_discrete=True disables the upper-bound heuristic
+    AND defaults DE to is_log1p=False. Override the latter explicitly. The same
+    option also prevents integer-valued log1p inputs from being renormalized.
+    """
+    summaries = {"real": expression_scale_summary(real), "pred": expression_scale_summary(pred)}
+    for name, summary in summaries.items():
+        if summary["nonfinite"] or summary["negative"]:
+            raise ValueError(
+                f"Explicit log1p input must be finite and nonnegative: {name} {summary}"
+            )
+    return {"allow_discrete": True, "pdex_kwargs": {"is_log1p": True}}, summaries
+
+
 def evaluate_perturbdiff_protocol(
     *,
     real_path: str | Path,
@@ -67,12 +120,15 @@ def evaluate_perturbdiff_protocol(
     control_pert: str,
     num_threads: int = 16,
     break_on_error: bool = True,
+    input_scale: str = "auto",
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Run Cell-Eval 0.6.6 full profile plus CellFlow R².
 
     Returns per-perturbation and summary tables using the labels from the
     PerturbDiff paper. Cell-Eval's original outputs are retained in ``outdir``.
     """
+    if input_scale not in {"auto", "log1p"}:
+        raise ValueError("input_scale must be auto or log1p")
     _require_cell_eval_066()
     from cell_eval import MetricsEvaluator
 
@@ -87,6 +143,22 @@ def evaluate_perturbdiff_protocol(
         control_pert=control_pert,
     )
 
+    options, audit = {}, None
+    if input_scale == "log1p":
+        options, summaries = explicit_log1p_options(real, pred)
+        audit = dict(
+            status="started",
+            cell_eval_version=CELL_EVAL_VERSION,
+            input_scale="log1p",
+            validation_override="Skip automatic max>=15/counts heuristic; keep raw input values",
+            pdex_is_log1p=True,
+            input_values_changed=False,
+            real_sha256=sha256_file(real_path),
+            prediction_sha256=sha256_file(pred_path),
+            summaries=summaries,
+        )
+        write_manifest(outdir / "input_scale_audit.json", audit)
+
     evaluator = MetricsEvaluator(
         adata_pred=pred,
         adata_real=real,
@@ -94,6 +166,7 @@ def evaluate_perturbdiff_protocol(
         pert_col=pert_col,
         num_threads=num_threads,
         outdir=str(outdir / "cell_eval_0.6.6"),
+        **options,
     )
     results, _ = evaluator.compute(
         profile="full",
@@ -132,4 +205,9 @@ def evaluate_perturbdiff_protocol(
     summary = numeric.agg(["count", "mean", "std", "min", "median", "max"])
     summary.index.name = "statistic"
     summary.to_csv(outdir / "perturbdiff_metrics_summary.csv")
+    if audit is not None:
+        audit["status"] = "complete"
+        audit["perturbations"] = len(paper)
+        audit["metrics_sha256"] = sha256_file(outdir / "perturbdiff_metrics_per_perturbation.csv")
+        write_manifest(outdir / "input_scale_audit.json", audit)
     return paper, summary

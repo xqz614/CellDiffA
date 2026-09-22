@@ -15,6 +15,12 @@ def main() -> None:
     parser.add_argument("--control-pert", required=True)
     parser.add_argument("--num-threads", type=int, default=16)
     parser.add_argument(
+        "--input-scale",
+        choices=["auto", "log1p"],
+        default="auto",
+        help="Declare verified log1p units without altering values; not a scale-repair option.",
+    )
+    parser.add_argument(
         "--continue-on-metric-error",
         action="store_true",
         help="Keep partial Cell-Eval results; strict failure is the default.",
@@ -28,6 +34,7 @@ def main() -> None:
         control_pert=args.control_pert,
         num_threads=args.num_threads,
         break_on_error=not args.continue_on_metric_error,
+        input_scale=args.input_scale,
     )
     print(summary.loc["mean"].to_string())
 
