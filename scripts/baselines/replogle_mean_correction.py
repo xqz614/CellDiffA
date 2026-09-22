@@ -36,6 +36,22 @@ def correct_mean(values, target):
     return result
 
 
+def prediction_contexts(real, prediction):
+    """Recover missing metadata by verified row IDs, never by assumed row order."""
+    if "cell_line" in prediction.obs:
+        return prediction.obs.cell_line.astype(str).to_numpy()
+    if (
+        not real.obs_names.is_unique
+        or not prediction.obs_names.is_unique
+        or not prediction.obs_names.isin(real.obs_names).all()
+    ):
+        raise ValueError("Prediction lacks cell_line and uniquely alignable reference row IDs")
+    metadata = real.obs.loc[prediction.obs_names]
+    if not np.array_equal(metadata.gene.astype(str), prediction.obs.gene.astype(str)):
+        raise ValueError("Prediction/reference perturbations disagree at the same row IDs")
+    return metadata.cell_line.astype(str).to_numpy()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in (
@@ -68,7 +84,10 @@ def main():
         embedding_signature=sha256_file(args.embeddings),
     )
     values = dense(prediction.X).copy()
-    contexts = real.obs.cell_line.astype(str).to_numpy()
+    # Prediction rows may be ordered differently from the reference. Metadata
+    # must index the matrix it belongs to, even when population counts match.
+    contexts = prediction_contexts(real, prediction)
+    prediction.obs["cell_line"] = contexts
     records = []
     for name in names:
         for context in sorted(set(contexts[labels == name])):
@@ -97,6 +116,10 @@ def main():
             source_prediction_sha256=sha256_file(args.pred),
             records=records,
             reference_sha256=sha256_file(args.real),
+            selected_genes_sha256=sha256_file(args.selected_genes),
+            split_config_sha256=sha256_file(args.split_config),
+            perturbation_embeddings_sha256=sha256_file(args.embeddings),
+            prior_ridge=1.0,
             prior_sources=priors.sources,
             target_policy="max(observed-control mean + training prior, 0)",
             residual_policy=(

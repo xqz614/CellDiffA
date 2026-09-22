@@ -297,6 +297,21 @@ def execute(command, config, env, log):
         )
 
 
+def evaluation_scale_arguments(config, name, prediction):
+    """Declare known PerturbDiff log1p units without hiding systemic anomalies."""
+    kind = next(
+        (job["kind"] for lane in config["lanes"] for job in lane if job["id"] == name), None
+    )
+    if kind not in {"perturbdiff", "mean"}:
+        return []
+    from scripts.server.recover_replogle_ablation_metrics import check_tail
+
+    # Same conservative range audit as the two recovered ablations. This does
+    # not clip, normalize, or discard any value and never exempts Squidiff.
+    check_tail(prediction)
+    return ["--input-scale", "log1p"]
+
+
 def evaluate(config, prediction, output, env):
     from celldiffa.benchmark.artifacts import sha256_file
     from celldiffa.benchmark.backbone_experiments import atomic_json
@@ -320,6 +335,7 @@ def evaluate(config, prediction, output, env):
         "--num-threads",
         "4",
     ]
+    command += evaluation_scale_arguments(config, output.name, prediction)
     execute(command, config, env, output / "evaluation.log")
     command = [
         config["python"],

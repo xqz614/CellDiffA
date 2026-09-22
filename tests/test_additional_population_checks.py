@@ -1,8 +1,10 @@
+import anndata as ad
 import numpy as np
 import pandas as pd
 import pytest
 
 from scripts.baselines.evaluate_population_diagnostics import effective_rank, sliced_wasserstein
+from scripts.baselines.replogle_mean_correction import prediction_contexts
 from scripts.baselines.run_squidiff_replogle import latent_shifts
 
 
@@ -32,3 +34,19 @@ def test_effective_rank_constant_float32_population_has_no_spurious_rank():
     # Accumulating a float32 mean can introduce an artificial nonzero direction.
     values = np.repeat(np.full((1, 64), 0.1, dtype=np.float32), 200, axis=0)
     assert effective_rank(values) == 0.0
+
+
+def test_mean_correction_recovers_missing_contexts_by_row_ids_not_positions():
+    real = ad.AnnData(
+        np.ones((3, 2)),
+        obs=pd.DataFrame(
+            dict(gene=["non-targeting", "A", "B"], cell_line=["x", "x", "y"]),
+            index=["c0", "c1", "c2"],
+        ),
+    )
+    pred = real[[0, 2, 1]].copy()
+    del pred.obs["cell_line"]
+    assert prediction_contexts(real, pred).tolist() == ["x", "y", "x"]
+    pred.obs_names = ["c0", "unknown", "c1"]
+    with pytest.raises(ValueError, match="row IDs"):
+        prediction_contexts(real, pred)

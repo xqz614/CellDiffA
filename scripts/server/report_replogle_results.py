@@ -47,6 +47,7 @@ EXCLUDED = {
     "wandb",
     "cell_eval_0.6.6",
     "launch_contracts",
+    "maintext_completion",  # Partial isolated timing runs, not full-test results.
     "__pycache__",
     ".git",
 }

@@ -1,5 +1,10 @@
 # Replogle main-text-first experiments
 
+For the currently generated results and unresolved Squidiff scale anomaly, use
+[the completion workflow](REPLOGLE_MAIN_TEXT_COMPLETION.md). It resumes only
+missing Replogle controls and queues figures, isolated timing, and native
+Squidiff diagnostics without restarting the anomalous full Squidiff pair.
+
 If the server has no Squidiff checkpoint and uploading is impractical, use
 [the train-on-server six-queue plan](REPLOGLE_SERVER_TRAIN_SQUIDIFF.md) instead.
 It trains once and automatically releases a matched vanilla/AdaCell pair.

@@ -75,12 +75,107 @@ def backbone_comparisons(tables):
     return pairs
 
 
+CONTROL_NAMES = (
+    "scratch_random16",
+    "scratch_best16",
+    "scratch_cellwise16",
+    "scratch_mean_correction",
+    "scratch_particles8",
+)
+
+
+def audit_controls(records):
+    """Check actual work, not just particle counts or names in a launch plan."""
+    from scripts.baselines.audit_replogle_steering_budget import compare_runs, read_run
+
+    primary, summary = read_run(records["scratch_main"]["output"] / "shards")
+    if not summary["sampling_coverage_complete"]:
+        raise ValueError("Main run has incomplete recorded sampling coverage")
+    expected = dict(
+        variant="scratch",
+        evaluation_split="test",
+        alpha=1.0,
+        seed=42,
+        num_particles=16,
+        alignment_mode="smc",
+        reward_normalization="zscore",
+        reward_weights=[1.0, 1.0, 1.0],
+    )
+    if any(primary.get(k) != v for k, v in expected.items()):
+        raise ValueError("Main run must be full Scratch alpha=1, seed=42, population SMC16")
+    if primary.get("reward_unit", "population") != "population":
+        raise ValueError("Main run must use population rewards")
+    output = {}
+    for name in ("scratch_random16", "scratch_best16", "scratch_cellwise16", "scratch_particles8"):
+        other, detail = read_run(records[name]["output"] / "shards")
+        for key in (
+            "alpha",
+            "reward_weights",
+            "reward_normalization",
+            "ess_threshold",
+            "prior_ridge",
+            "top_de",
+            "anchor_bandwidth",
+            "anchor_estimator",
+            "perturbation_embeddings_sha256",
+        ):
+            if key not in primary or other.get(key) != primary[key]:
+                raise ValueError(f"Different steering/prior setting: {name}/{key}")
+        mode, unit = {
+            "scratch_random16": ("random", "population"),
+            "scratch_best16": ("best_of_n", "population"),
+            "scratch_cellwise16": ("smc", "cell"),
+            "scratch_particles8": ("smc", "population"),
+        }[name]
+        if other.get("alignment_mode") != mode or other.get("reward_unit", "population") != unit:
+            raise ValueError(f"Unexpected control mode: {name}")
+        if name == "scratch_particles8":
+            if other["num_particles"] != 8:
+                raise ValueError("Eight-particle experiment does not use eight particles")
+            scaled = {
+                **detail,
+                "groups": {k: [*v[:3], v[3] * 2] for k, v in detail["groups"].items()},
+            }
+            compare = compare_runs(primary, summary, {**other, "num_particles": 16}, scaled)
+            output[name] = dict(
+                population_and_schedule_match_verified=compare["full_budget_match_verified"],
+                full_budget_match_verified=False,
+                denoised_cell_steps_ratio=detail["denoised_cell_steps"]
+                / summary["denoised_cell_steps"],
+            )
+            if not compare["full_budget_match_verified"]:
+                raise ValueError("Incomplete eight-particle experiment")
+            continue
+        output[name] = compare_runs(primary, summary, other, detail)
+        if not output[name]["full_budget_match_verified"]:
+            raise ValueError(f"Incomplete recorded work: {name}")
+    correction = records["scratch_mean_correction"]["output"] / "provenance.json"
+    saved = json.loads(correction.read_text())
+    if saved.get("source_prediction_sha256") != sha256_file(
+        records["scratch_random16"]["prediction"]
+    ):
+        raise ValueError("Mean correction did not use the matched random16 predictions")
+    if saved.get("test_response_values_used_for_correction") is not False:
+        raise ValueError("Mean-correction information-access contract is missing")
+    return output
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plan", type=Path, required=True)
     parser.add_argument("--main-pred", type=Path, required=True)
     parser.add_argument("--main-metrics", type=Path, required=True)
     parser.add_argument("--outdir", type=Path, required=True)
+    parser.add_argument(
+        "--perturbdiff-only",
+        action="store_true",
+        help="Exclude pending independent backbones from this analysis",
+    )
+    parser.add_argument(
+        "--require-controls",
+        action="store_true",
+        help="Require every main-text control and audit matched denoising work",
+    )
     args = parser.parse_args()
     if args.outdir.exists():
         raise FileExistsError("Use a new analysis output directory")
@@ -99,6 +194,8 @@ def main():
         for job in lane:
             if job["kind"] in {"train", "train_squidiff"}:
                 continue
+            if args.perturbdiff_only and job["kind"] not in {"perturbdiff", "mean"}:
+                continue
             output = root / "runs" / job["id"]
             prediction = output / (
                 "celldiffa_scratch.h5ad" if job["kind"] == "perturbdiff" else "predictions.h5ad"
@@ -111,6 +208,11 @@ def main():
                 missing.append(job["id"])
                 continue
             records[job["id"]] = dict(prediction=prediction, metrics=metrics, output=output)
+    if args.require_controls:
+        absent = set(CONTROL_NAMES) - set(records)
+        if absent:
+            raise ValueError(f"Missing required controls: {sorted(absent)}")
+    budget_audit = audit_controls(records) if args.require_controls else {}
     args.outdir.mkdir(parents=True)
     tables, summaries, provenance, intervals = {}, [], {}, []
     for name, record in records.items():
@@ -152,17 +254,19 @@ def main():
                 "--outdir",
                 str(args.outdir / "diagnostics" / name),
             ]
+            if name.startswith("scratch_") and "scratch_random16" in records:
+                sys.argv += ["--base", str(records["scratch_random16"]["prediction"])]
             diagnostics_main()
         finally:
             sys.argv = old_argv
         diagnostics = pd.read_csv(
             args.outdir / "diagnostics" / name / "population_diagnostics.csv"
         ).set_index("perturbation")
-        table = table.join(
-            diagnostics[
-                ["predicted_to_real_variance", "predicted_to_real_rank", "sliced_w1_to_real"]
-            ]
-        )
+        columns = ["predicted_to_real_variance", "predicted_to_real_rank", "sliced_w1_to_real"]
+        columns += [
+            c for c in ("sliced_w1_to_base", "predicted_to_base_variance") if c in diagnostics
+        ]
+        table = table.join(diagnostics[columns])
         tables[name] = table
         timing, ancestors = [], []
         for path in sorted((record["output"] / "shards").glob("group_*.diagnostics.json")):
@@ -273,8 +377,8 @@ def main():
         )
         if n in tables
     ]
-    fig, axes = plt.subplots(1, 3, figsize=(8.5, 2.8), constrained_layout=True)
-    for axis, metric in zip(axes, ("DEOver", "PDS_cos", "predicted_to_real_variance")):
+    fig, axes = plt.subplots(1, 4, figsize=(10, 2.8), constrained_layout=True)
+    for axis, metric in zip(axes, ("DEOver", "PDCorr", "PDS_cos", "predicted_to_real_variance")):
         for i, name in enumerate(order):
             mean, low, high = bootstrap(tables[name][metric])
             axis.errorbar(
@@ -303,6 +407,23 @@ def main():
             axis.set(xlabel="Response accuracy (PDS-cos)", ylabel=metric)
     axes[0].axhline(1, color="gray", linestyle="--", linewidth=0.7)
     save(fig, "accuracy_diversity")
+    drift_order = [n for n in order if "sliced_w1_to_base" in tables[n]]
+    if drift_order:
+        fig, axes = plt.subplots(1, 2, figsize=(7, 2.8), constrained_layout=True)
+        for name in drift_order:
+            row = tables[name].mean(numeric_only=True)
+            for axis, metric in zip(axes, ("sliced_w1_to_base", "predicted_to_base_variance")):
+                axis.scatter(row[metric], row.PDCorr, s=25)
+                axis.annotate(
+                    name.replace("scratch_", ""),
+                    (row[metric], row.PDCorr),
+                    fontsize=6,
+                    xytext=(3, 3),
+                    textcoords="offset points",
+                )
+                axis.set(xlabel=metric, ylabel="Response accuracy (PDCorr)")
+        axes[1].axvline(1, color="gray", linestyle="--", linewidth=0.7)
+        save(fig, "accuracy_base_drift")
     backbone_pairs = backbone_comparisons(tables)
     if backbone_pairs:
         fig, axes = plt.subplots(1, 2, figsize=(7, 2.7), constrained_layout=True)
@@ -319,7 +440,10 @@ def main():
                         high=high,
                         guided=guided,
                         baseline=baseline,
-                        matched_denoising_budget=matched,
+                        matched_denoising_budget=(
+                            matched and label == "PerturbDiff" and bool(budget_audit)
+                        ),
+                        nominal_particle_count_match=matched,
                     )
                 )
                 axis.errorbar(
@@ -335,7 +459,13 @@ def main():
                 xticklabels=[
                     label
                     + "\nvs "
-                    + ("random16 (matched)" if matched else "vanilla1 (unequal budget)")
+                    + (
+                        "random16 (audited)"
+                        if matched and label == "PerturbDiff" and budget_audit
+                        else "random16 (budget unaudited)"
+                        if matched
+                        else "vanilla1 (unequal budget)"
+                    )
                     for label, _, _, matched in backbone_pairs
                 ],
                 ylabel=f"Δ {metric} versus indicated reference",
@@ -351,6 +481,8 @@ def main():
             missing_jobs=missing,
             protocol_complete=not missing,
             test_based_parameter_selection=False,
+            budget_audit=budget_audit,
+            scope="PerturbDiff only" if args.perturbdiff_only else "all plan backbones",
             intervals="2000 perturbation bootstrap resamples, conditional on a generation seed",
             limitations=[
                 "Effect strata are descriptive, not denoising-loss causal evidence",
