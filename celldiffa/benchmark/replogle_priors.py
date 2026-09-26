@@ -35,6 +35,58 @@ def _source_signature(path: Path) -> dict[str, int]:
     return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
 
 
+def validate_prior_robustness(mode: str, fraction: float, seed: int) -> None:
+    """Validate prior-only interventions before reading expression data."""
+    if mode not in {"full", "subsample", "shuffle"}:
+        raise ValueError("prior_mode must be full, subsample, or shuffle.")
+    if not np.isfinite(fraction) or not 0 < fraction <= 1:
+        raise ValueError("prior_fraction must be finite and in (0, 1].")
+    if mode != "subsample" and fraction != 1.0:
+        raise ValueError("prior_fraction must be 1.0 unless prior_mode is subsample.")
+    if not isinstance(seed, (int, np.integer)) or seed < 0:
+        raise ValueError("prior_seed must be a nonnegative integer.")
+
+
+def _subsample_training_mask(
+    train: np.ndarray,
+    labels: np.ndarray,
+    contexts: np.ndarray,
+    control_pert: str,
+    *,
+    fraction: float,
+    seed: int,
+) -> np.ndarray:
+    """Keep all training controls and sample treated rows within each stratum.
+
+    A stratum is a (perturbation, context) pair. Sampling uses only row metadata
+    and a local RNG; it never inspects held-out or training expression values.
+    Each nonempty stratum retains max(1, floor(fraction * n)) treated rows.
+    """
+    selected = train.copy()
+    if fraction == 1.0:
+        return selected
+    treated = train & (labels != control_pert)
+    selected[treated] = False
+    rng = np.random.default_rng(seed)
+    strata: dict[tuple[str, str], list[int]] = {}
+    for index in np.flatnonzero(treated):
+        strata.setdefault((labels[index], contexts[index]), []).append(int(index))
+    for key in sorted(strata):
+        indices = np.asarray(strata[key], dtype=np.int64)
+        size = max(1, int(np.floor(fraction * len(indices))))
+        selected[rng.choice(indices, size=size, replace=False)] = True
+    return selected
+
+
+def _shuffled_prior_donors(targets: Iterable[str], seed: int) -> dict[str, str]:
+    """Make a reproducible single-cycle derangement of eligible target priors."""
+    names = sorted(set(targets))
+    if len(names) < 2:
+        raise ValueError("Shuffled priors require at least two eligible target perturbations.")
+    order = np.random.default_rng(seed).permutation(names).tolist()
+    return {target: order[(index + 1) % len(order)] for index, target in enumerate(order)}
+
+
 def _metadata(
     source: Path,
     split_path: Path,
@@ -45,8 +97,11 @@ def _metadata(
     embedding_signature: str | None,
     ridge_penalty: float,
     evaluation_split: str,
+    prior_mode: str = "full",
+    prior_fraction: float = 1.0,
+    prior_seed: int = 42,
 ) -> dict:
-    return {
+    metadata = {
         "format_version": 3,
         "evaluation_split": evaluation_split,
         "source": str(source),
@@ -60,6 +115,17 @@ def _metadata(
         "embedding_signature": embedding_signature,
         "ridge_penalty": ridge_penalty,
     }
+    # Exact legacy metadata remains valid for the unmodified default. Every
+    # robustness variant has a distinct cache contract, preventing false hits.
+    if (prior_mode, prior_fraction, prior_seed) != ("full", 1.0, 42):
+        metadata.update(
+            format_version=4,
+            prior_robustness_version=1,
+            prior_mode=prior_mode,
+            prior_fraction=prior_fraction,
+            prior_seed=prior_seed,
+        )
+    return metadata
 
 
 def _load_cache(path: Path, expected: dict) -> ReplogleTrainingPriors | None:
@@ -148,6 +214,9 @@ def compute_replogle_training_priors(
     embedding_signature: str | None = None,
     ridge_penalty: float = 1.0,
     evaluation_split: str = "test",
+    prior_mode: str = "full",
+    prior_fraction: float = 1.0,
+    prior_seed: int = 42,
 ) -> ReplogleTrainingPriors:
     """Compute validation/test priors without using any held-out responses.
 
@@ -155,7 +224,13 @@ def compute_replogle_training_priors(
     line before pooling. Controls in the held-out context are allowed because
     the prediction task explicitly conditions on control cells; validation and
     test perturbation rows are excluded by the released split mask.
+
+    Robustness options affect only these reward priors. Subsampling retains
+    all training controls and refits direct shifts and descriptor regression
+    from selected treated rows. Shuffling reassigns the resulting target
+    shifts without changing any denoiser condition or reading test responses.
     """
+    validate_prior_robustness(prior_mode, prior_fraction, prior_seed)
     source = Path(source).resolve()
     split_path = Path(split_path).resolve()
     if top_k < 1:
@@ -180,6 +255,8 @@ def compute_replogle_training_priors(
         )
     if not target_perts:
         raise ValueError("At least one target perturbation is required.")
+    if prior_mode == "shuffle" and len(target_perts) < 2:
+        raise ValueError("Shuffled priors require at least two eligible target perturbations.")
     expected = _metadata(
         source,
         split_path,
@@ -190,6 +267,9 @@ def compute_replogle_training_priors(
         embedding_signature,
         ridge_penalty,
         evaluation_split,
+        prior_mode,
+        prior_fraction,
+        prior_seed,
     )
     cache = Path(cache_path).resolve() if cache_path is not None else None
     if cache is not None:
@@ -207,6 +287,15 @@ def compute_replogle_training_priors(
     labels = obs[split.pert_col].astype(str).to_numpy()
     contexts = obs[split.context_col].astype(str).to_numpy()
     train = masks["train"]
+    if prior_mode == "subsample":
+        train = _subsample_training_mask(
+            train,
+            labels,
+            contexts,
+            split.control_pert,
+            fraction=prior_fraction,
+            seed=prior_seed,
+        )
     control = train & (labels == split.control_pert)
     context_names = sorted(set(contexts[control]))
     control_sums = {name: np.zeros(len(genes), dtype=np.float64) for name in context_names}
@@ -277,6 +366,17 @@ def compute_replogle_training_priors(
         pert: "direct_training_mean" if counts[pert] > 0 else "genept_dual_ridge"
         for pert in target_perts
     }
+    if prior_mode == "shuffle":
+        donors = _shuffled_prior_donors(target_perts, prior_seed)
+        original_shifts, original_counts, original_sources = shifts, counts, sources
+        shifts = {pert: original_shifts[donors[pert]].copy() for pert in target_perts}
+        counts = {pert: original_counts[donors[pert]] for pert in target_perts}
+        sources = {
+            pert: f"shuffled:{donors[pert]}:{original_sources[donors[pert]]}"
+            for pert in target_perts
+        }
+    # Re-select signature genes from the intervened shift, never from the
+    # original target's shift or held-out differential-expression statistics.
     de_indices = np.stack(
         [np.argsort(-np.abs(shifts[pert]))[: min(top_k, len(genes))] for pert in target_perts]
     )

@@ -39,6 +39,9 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--top-de", type=int, default=20)
     parser.add_argument("--anchor-bandwidth", type=float, default=1.0)
     parser.add_argument("--prior-ridge", type=float, default=1.0)
+    parser.add_argument("--prior-mode", choices=["full", "subsample", "shuffle"], default="full")
+    parser.add_argument("--prior-fraction", type=float, default=1.0)
+    parser.add_argument("--prior-seed", type=int, default=42)
     parser.add_argument("--worker-index", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=1)
     parser.add_argument("--max-groups", type=int)
@@ -51,6 +54,12 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
         parser.error("max-groups must be positive.")
     if args.native_blocks_per_population < 1:
         parser.error("native-blocks-per-population must be positive.")
+    from celldiffa.benchmark.replogle_priors import validate_prior_robustness
+
+    try:
+        validate_prior_robustness(args.prior_mode, args.prior_fraction, args.prior_seed)
+    except ValueError as error:
+        parser.error(str(error))
     return args, hydra_overrides
 
 
@@ -191,6 +200,13 @@ def main() -> None:
     # Preserve the original population run contract for existing server runs.
     if args.reward_unit != "population":
         run_config["reward_unit"] = args.reward_unit
+    if (args.prior_mode, args.prior_fraction, args.prior_seed) != ("full", 1.0, 42):
+        run_config.update(
+            prior_mode=args.prior_mode,
+            prior_fraction=args.prior_fraction,
+            prior_seed=args.prior_seed,
+            prior_robustness_version=1,
+        )
     # One worker establishes the run contract and prior cache; other GPU
     # workers wait, then reuse both. This prevents cache races and accidental
     # mixing of shards from different CellDiffA settings.
@@ -218,6 +234,9 @@ def main() -> None:
             embedding_signature=embedding_sha256,
             ridge_penalty=args.prior_ridge,
             evaluation_split=args.evaluation_split,
+            prior_mode=args.prior_mode,
+            prior_fraction=args.prior_fraction,
+            prior_seed=args.prior_seed,
         )
         fcntl.flock(lock_handle, fcntl.LOCK_UN)
 
@@ -453,6 +472,11 @@ def main() -> None:
             "no held-out perturbed expression"
         ),
         "prior_sources": priors.sources,
+        "prior_counts": priors.counts,
+        "prior_mode": args.prior_mode,
+        "prior_fraction": args.prior_fraction,
+        "prior_seed": args.prior_seed,
+        "prior_robustness_version": 1,
         "prior_ridge": args.prior_ridge,
         "evaluation_genes": len(selected_genes),
         "normalization_scale": normalize_counts,
